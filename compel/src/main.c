@@ -18,6 +18,11 @@
 #include "version.h"
 #include "piegen.h"
 #include "log.h"
+#include "../flog/include/flog.h"
+
+
+#define BUF_SIZE (1<<20)
+#define MAGIC 0xABCDABCD
 
 #define CFLAGS_DEFAULT_SET					\
 	"-Wstrict-prototypes "					\
@@ -60,8 +65,63 @@ static const flags_t flags = {
 #endif
 };
 
-piegen_opt_t opts = {};
+static char _mbuf[BUF_SIZE];
+static char *mbuf = _mbuf;
+static char *fbuf;
+static uint64_t fsize;
+static uint64_t mbuf_size = sizeof(_mbuf);
+
 const char *uninst_root;
+
+
+
+int flog_map_buf(int fdout)
+{
+	uint64_t off = 0;
+	void *addr;
+
+	/*
+	 * Two buffers are mmaped into memory. A new one is mapped when a first
+	 * one is completly filled.
+	 */
+	if (fbuf && (mbuf - fbuf < BUF_SIZE))
+		return 0;
+
+	if (fbuf) {
+		if (munmap(fbuf, BUF_SIZE * 2)) {
+			fprintf(stderr, "Unable to unmap a buffer: %m");
+			return 1;
+		}
+		off = mbuf - fbuf - BUF_SIZE;
+		fbuf = NULL;
+	}
+
+	if (fsize == 0)
+		fsize += BUF_SIZE;
+	fsize += BUF_SIZE;
+
+	if (ftruncate(fdout, fsize)) {
+		fprintf(stderr, "Unable to truncate a file: %m");
+		return -1;
+	}
+
+	if (!fbuf)
+		addr = mmap(NULL, BUF_SIZE * 2, PROT_WRITE | PROT_READ,
+			    MAP_FILE | MAP_SHARED, fdout, fsize - 2 * BUF_SIZE);
+	else
+		addr = mremap(fbuf + BUF_SIZE, BUF_SIZE,
+				BUF_SIZE * 2, MREMAP_FIXED, fbuf);
+	if (addr == MAP_FAILED) {
+		fprintf(stderr, "Unable to map a buffer: %m");
+		return -1;
+	}
+
+	fbuf = addr;
+	mbuf = fbuf + off;
+	mbuf_size = 2 * BUF_SIZE;
+
+	return 0;
+}
 
 static int piegen(void)
 {
@@ -110,7 +170,7 @@ err:
 	return ret;
 }
 
-static void cli_log(unsigned int lvl, const char *fmt, va_list parms)
+static void cli_log(unsigned int lvl, const char *fmt, size_t mbuf_size, unsigned int nargs,  va_list parms)//себе такую
 {
 	FILE *f = stdout;
 
@@ -120,8 +180,28 @@ static void cli_log(unsigned int lvl, const char *fmt, va_list parms)
 	if ((lvl == COMPEL_LOG_ERROR) || (lvl == COMPEL_LOG_WARN))
 		f = stderr;
 
-	vfprintf(f, fmt, parms);
+	vfprintf(f, fmt, parms);// обращение к флог
 }
+
+static int bin_log(unsigned int lvl, const char *fmt, size_t mbuf_size, unsigned int nargs,  va_list parms)//себе такую
+{
+	//FILE *f = stdout;
+int fdout = STDOUT_FILENO;
+
+	if (pr_quelled(lvl))
+		return -1;
+
+	/*if ((lvl == COMPEL_LOG_ERROR) || (lvl == COMPEL_LOG_WARN))
+		fdout = stderr;*/
+
+if (mbuf != _mbuf && flog_map_buf(fdout))
+		return-1;
+
+//flog_encode_msg(mbuf,(long) fmt, parms);
+
+	//vfprintf(f, fmt, parms);// обращение к флог
+}
+
 
 static int usage(int rc) {
 	FILE *out = (rc == 0) ? stdout : stderr;
@@ -308,6 +388,9 @@ int main(int argc, char *argv[])
 	int opt, idx;
 	char *action;
 
+//for flog
+int fdout = STDOUT_FILENO;
+
 	static const char short_opts[] = "csf:o:p:hVl:";
 	static struct option long_opts[] = {
 		{ "compat",	no_argument,		0, 'c' },
@@ -412,7 +495,11 @@ int main(int argc, char *argv[])
 				return 2;
 			}
 		}
-		compel_log_init(&cli_log, log_level);
+
+if (fdout != STDOUT_FILENO && flog_map_buf(fdout))//инициализация буфера
+			return 1;
+compel_log_init(&bin_log, log_level);//подсунуть другую функцию
+		compel_log_init(&cli_log, log_level);//подсунуть другую функцию
 		return piegen();
 	}
 

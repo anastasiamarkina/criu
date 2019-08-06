@@ -3,6 +3,7 @@
 
 #include "uapi/compel/compel.h"
 #include "uapi/compel/loglevels.h"
+#include "../flog/include/flog.h"
 
 #ifndef LOG_PREFIX
 # define LOG_PREFIX
@@ -17,6 +18,13 @@ static inline int pr_quelled(unsigned int loglevel)
 extern void compel_print_on_level(unsigned int loglevel,
 		const char *format, ...)
 		__attribute__ ((__format__ (__printf__, 2, 3)));
+void compel_print_on_level_msg(unsigned int loglevel, size_t mbuf_size, unsigned int nargs, unsigned int mask, const char *format, ...);
+
+#define compel_print_on_level(loglevel, fmt, ...)  \
+  	compel_print_on_level_msg(loglevel,  FLOG_PP_NARG(VA_ARGS),  	\
+				FLOG_GENMASK(flog_genbit, ##__VA_ARGS__), fmt, \
+				##__VA_ARGS__)
+
 
 #define pr_msg(fmt, ...)						\
 	compel_print_on_level(COMPEL_LOG_MSG,				\
