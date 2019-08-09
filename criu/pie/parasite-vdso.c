@@ -74,18 +74,8 @@ int vdso_do_park(struct vdso_maps *rt, unsigned long park_at,
 	return ret;
 }
 
-/* XXX: move in arch/ */
-#if defined(CONFIG_X86_64) && defined(CONFIG_COMPAT)
-int __vdso_fill_symtable(uintptr_t mem, size_t size,
-		struct vdso_symtable *t, bool compat_vdso)
-{
-	if (compat_vdso)
-		return vdso_fill_symtable_compat(mem, size, t);
-	else
-		return vdso_fill_symtable(mem, size, t);
-}
-#else
-int __vdso_fill_symtable(uintptr_t mem, size_t size,
+#ifndef CONFIG_COMPAT
+static int __vdso_fill_symtable(uintptr_t mem, size_t size,
 		struct vdso_symtable *t, bool __always_unused compat_vdso)
 {
 	return vdso_fill_symtable(mem, size, t);
@@ -105,23 +95,44 @@ int __vdso_fill_symtable(uintptr_t mem, size_t size,
 static bool blobs_matches(VmaEntry *vdso_img, VmaEntry *vvar_img,
 		struct vdso_symtable *sym_img, struct vdso_symtable *sym_rt)
 {
+	unsigned long vdso_size = vma_entry_len(vdso_img);
+	unsigned long rt_vdso_size = sym_rt->vdso_size;
 	size_t i;
 
-	if (vma_entry_len(vdso_img) != sym_rt->vdso_size)
+	if (vdso_size != rt_vdso_size) {
+		pr_info("size differs: %lx != %lx (rt)\n",
+			vdso_size, rt_vdso_size);
 		return false;
+	}
 
 	for (i = 0; i < ARRAY_SIZE(sym_img->symbols); i++) {
-		if (sym_img->symbols[i].offset != sym_rt->symbols[i].offset)
+		unsigned long sym_offset	= sym_img->symbols[i].offset;
+		unsigned long rt_sym_offset	= sym_rt->symbols[i].offset;
+		char *sym_name			= sym_img->symbols[i].name;
+
+		if (sym_offset != rt_sym_offset) {
+			pr_info("[%zu]`%s` offset differs: %lx != %lx (rt)\n",
+				i, sym_name, sym_offset, rt_sym_offset);
 			return false;
+		}
 	}
 
 	if (vvar_img && sym_rt->vvar_size != VVAR_BAD_SIZE) {
 		bool vdso_firstly = (vvar_img->start > vdso_img->start);
+		unsigned long vvar_size = vma_entry_len(vvar_img);
+		unsigned long rt_vvar_size = sym_rt->vvar_size;
 
-		if (sym_rt->vvar_size != vma_entry_len(vvar_img))
+		if (vvar_size != rt_vvar_size) {
+			pr_info("vvar size differs: %lx != %lx (rt)\n",
+				vdso_size, rt_vdso_size);
 			return false;
+		}
 
-		return (vdso_firstly == sym_rt->vdso_before_vvar);
+		if (vdso_firstly != sym_rt->vdso_before_vvar) {
+			pr_info("[%s] pair has different order\n",
+				vdso_firstly ? "vdso/vvar" : "vvar/vdso");
+			return false;
+		}
 	}
 
 	return true;
@@ -137,11 +148,17 @@ static int remap_rt_vdso(VmaEntry *vma_vdso, VmaEntry *vma_vvar,
 {
 	unsigned long rt_vvar_addr = vdso_rt_parked_at;
 	unsigned long rt_vdso_addr = vdso_rt_parked_at;
+	void *remap_addr;
 	int ret;
 
 	pr_info("Runtime vdso/vvar matches dumpee, remap inplace\n");
 
-	if (sys_munmap((void *)vma_vdso->start, vma_entry_len(vma_vdso))) {
+	/*
+	 * Ugly casts for 32bit platforms, which don't like uint64_t
+	 * cast to (void *)
+	 */
+	remap_addr = (void *)(uintptr_t)vma_vdso->start;
+	if (sys_munmap(remap_addr, vma_entry_len(vma_vdso))) {
 		pr_err("Failed to unmap dumpee vdso\n");
 		return -1;
 	}
@@ -151,7 +168,8 @@ static int remap_rt_vdso(VmaEntry *vma_vdso, VmaEntry *vma_vvar,
 				vma_vdso->start, sym_rt->vdso_size);
 	}
 
-	if (sys_munmap((void *)vma_vvar->start, vma_entry_len(vma_vvar))) {
+	remap_addr = (void *)(uintptr_t)vma_vvar->start;
+	if (sys_munmap(remap_addr, vma_entry_len(vma_vvar))) {
 		pr_err("Failed to unmap dumpee vvar\n");
 		return -1;
 	}

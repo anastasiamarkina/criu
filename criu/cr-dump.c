@@ -1,4 +1,3 @@
-#include <sys/time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -14,10 +13,8 @@
 #include <sys/stat.h>
 #include <sys/vfs.h>
 #include <sys/time.h>
-#include <sys/resource.h>
 #include <sys/wait.h>
 
-#include <sys/sendfile.h>
 
 #include <sched.h>
 #include <sys/resource.h>
@@ -83,6 +80,7 @@
 #include "fault-injection.h"
 #include "dump.h"
 #include "eventpoll.h"
+#include "img-remote.h"
 
 /*
  * Architectures can overwrite this function to restore register sets that
@@ -1471,10 +1469,11 @@ static int setup_alarm_handler()
 	return 0;
 }
 
-static int cr_pre_dump_finish(int ret)
+static int cr_pre_dump_finish(int status)
 {
 	InventoryEntry he = INVENTORY_ENTRY__INIT;
 	struct pstree_item *item;
+	int ret;
 
 	/*
 	 * Restore registers for tasks only. The threads have not been
@@ -1484,13 +1483,18 @@ static int cr_pre_dump_finish(int ret)
 	if (ret)
 		goto err;
 
-	ret = invertory_save_uptime(&he);
+	ret = inventory_save_uptime(&he);
 	if (ret)
 		goto err;
 
 	pstree_switch_state(root_item, TASK_ALIVE);
 
 	timing_stop(TIME_FROZEN);
+
+	if (status < 0) {
+		ret = status;
+		goto err;
+	}
 
 	pr_info("Pre-dumping tasks' memory\n");
 	for_each_pstree_item(item) {
@@ -1553,6 +1557,16 @@ int cr_pre_dump_tasks(pid_t pid)
 	InventoryEntry *parent_ie = NULL;
 	struct pstree_item *item;
 	int ret = -1;
+
+	/*
+	 * We might need a lot of pipes to fetch huge number of pages to dump.
+	 */
+	rlimit_unlimit_nofile();
+
+	if (opts.remote && push_snapshot_id() < 0) {
+		pr_err("Failed to push image namespace.\n");
+		goto err;
+	}
 
 	root_item = alloc_pstree_item();
 	if (!root_item)
@@ -1638,8 +1652,10 @@ static int cr_lazy_mem_dump(void)
 	ret = cr_page_server(false, true, -1);
 
 	for_each_pstree_item(item) {
-		destroy_page_pipe(dmpi(item)->mem_pp);
-		compel_cure_local(dmpi(item)->parasite_ctl);
+		if (item->pid->state != TASK_DEAD) {
+			destroy_page_pipe(dmpi(item)->mem_pp);
+			compel_cure_local(dmpi(item)->parasite_ctl);
+		}
 	}
 
 	if (ret)
@@ -1728,6 +1744,11 @@ static int cr_dump_finish(int ret)
 
 	close_service_fd(CR_PROC_FD_OFF);
 
+	if (opts.remote && (finish_remote_dump() < 0)) {
+		pr_err("Finish remote dump failed.\n");
+		return post_dump_ret ? : 1;
+	}
+
 	if (ret) {
 		pr_err("Dumping FAILED.\n");
 	} else {
@@ -1748,6 +1769,18 @@ int cr_dump_tasks(pid_t pid)
 	pr_info("========================================\n");
 	pr_info("Dumping processes (pid: %d)\n", pid);
 	pr_info("========================================\n");
+
+	/*
+	 *  We will fetch all file descriptors for each task, their number can
+	 *  be bigger than a default file limit, so we need to raise it to the
+	 *  maximum.
+	 */
+	rlimit_unlimit_nofile();
+
+	if (opts.remote && push_snapshot_id() < 0) {
+		pr_err("Failed to push image namespace.\n");
+		goto err;
+	}
 
 	root_item = alloc_pstree_item();
 	if (!root_item)
@@ -1894,7 +1927,7 @@ int cr_dump_tasks(pid_t pid)
 	if (ret)
 		goto err;
 
-	ret = invertory_save_uptime(&he);
+	ret = inventory_save_uptime(&he);
 	if (ret)
 		goto err;
 

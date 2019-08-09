@@ -101,7 +101,6 @@ extern bool img_common_magic;
 #define O_NOBUF		(O_DIRECT)
 #define O_SERVICE	(O_DIRECTORY)
 #define O_DUMP		(O_WRONLY | O_CREAT | O_TRUNC)
-#define O_SHOW		(O_RDONLY | O_NOBUF)
 #define O_RSTR		(O_RDONLY)
 #define O_FORCE_LOCAL	(O_SYNC)
 
@@ -134,6 +133,8 @@ extern int open_image_lazy(struct cr_img *img);
 
 static inline int img_raw_fd(struct cr_img *img)
 {
+	if (!img)
+		return -1;
 	if (lazy_image(img) && open_image_lazy(img))
 		return -1;
 

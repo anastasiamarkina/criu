@@ -18,7 +18,6 @@ import sys
 import linecache
 import random
 import string
-import imp
 import fcntl
 import errno
 import datetime
@@ -575,18 +574,35 @@ class zdtm_test:
 		subprocess.check_call(["flock", "zdtm_mount_cgroups.lock", "./zdtm_umount_cgroups"])
 
 
+def load_module_from_file(name, path):
+	if sys.version_info[0] == 3 and sys.version_info[1] >= 5:
+		import importlib.util
+		spec = importlib.util.spec_from_file_location(name, path)
+		mod = importlib.util.module_from_spec(spec)
+		spec.loader.exec_module(mod)
+	else:
+		import imp
+		mod = imp.load_source(name, path)
+	return mod
+
+
 class inhfd_test:
 	def __init__(self, name, desc, flavor, freezer):
 		self.__name = os.path.basename(name)
 		print("Load %s" % name)
-		self.__fdtyp = imp.load_source(self.__name, name)
+		self.__fdtyp = load_module_from_file(self.__name, name)
 		self.__peer_pid = 0
 		self.__files = None
 		self.__peer_file_names = []
 		self.__dump_opts = []
+		self.__messages = {}
 
 	def __get_message(self, i):
-		return b"".join([random.choice(string.ascii_letters).encode() for _ in range(10)]) + b"%06d" % i
+		m = self.__messages.get(i, None)
+		if not m:
+			m = b"".join([random.choice(string.ascii_letters).encode() for _ in range(10)]) + b"%06d" % i
+		self.__messages[i] = m
+		return m
 
 	def start(self):
 		self.__files = self.__fdtyp.create_fds()
@@ -617,7 +633,9 @@ class inhfd_test:
 			fd = os.open(self.__name + ".out", os.O_WRONLY | os.O_APPEND | os.O_CREAT)
 			os.dup2(fd, 1)
 			os.dup2(fd, 2)
-			os.close(0)
+			os.close(fd)
+			fd = os.open("/dev/null", os.O_RDONLY)
+			os.dup2(fd, 0)
 			for my_file, _ in self.__files:
 				my_file.close()
 			os.close(start_pipe[0])
@@ -922,26 +940,28 @@ class criu:
 		self.__dump_path = None
 		self.__iter = 0
 		self.__prev_dump_iter = None
-		self.__page_server = (opts['page_server'] and True or False)
-		self.__remote_lazy_pages = (opts['remote_lazy_pages'] and True or False)
+		self.__page_server = bool(opts['page_server'])
+		self.__remote_lazy_pages = bool(opts['remote_lazy_pages'])
 		self.__lazy_pages = (self.__remote_lazy_pages or
-				     opts['lazy_pages'] and True or False)
-		self.__lazy_migrate = (opts['lazy_migrate'] and True or False)
-		self.__restore_sibling = (opts['sibling'] and True or False)
-		self.__join_ns = (opts['join_ns'] and True or False)
-		self.__empty_ns = (opts['empty_ns'] and True or False)
-		self.__fault = (opts['fault'])
+				     bool(opts['lazy_pages']))
+		self.__lazy_migrate = bool(opts['lazy_migrate'])
+		self.__restore_sibling = bool(opts['sibling'])
+		self.__join_ns = bool(opts['join_ns'])
+		self.__empty_ns = bool(opts['empty_ns'])
+		self.__fault = opts['fault']
 		self.__script = opts['script']
-		self.__sat = (opts['sat'] and True or False)
-		self.__dedup = (opts['dedup'] and True or False)
-		self.__mdedup = (opts['noauto_dedup'] and True or False)
-		self.__user = (opts['user'] and True or False)
-		self.__leave_stopped = (opts['stop'] and True or False)
+		self.__sat = bool(opts['sat'])
+		self.__dedup = bool(opts['dedup'])
+		self.__mdedup = bool(opts['noauto_dedup'])
+		self.__user = bool(opts['user'])
+		self.__leave_stopped = bool(opts['stop'])
+		self.__remote = bool(opts['remote'])
 		self.__criu = (opts['rpc'] and criu_rpc or criu_cli)
-		self.__show_stats = (opts['show_stats'] and True or False)
+		self.__show_stats = bool(opts['show_stats'])
 		self.__lazy_pages_p = None
 		self.__page_server_p = None
 		self.__dump_process = None
+		self.__tls = self.__tls_options() if opts['tls'] else []
 		self.__criu_bin = opts['criu_bin']
 		self.__crit_bin = opts['crit_bin']
 
@@ -989,6 +1009,13 @@ class criu:
 		if self.__dump_path:
 			print("Removing %s" % self.__dump_path)
 			shutil.rmtree(self.__dump_path)
+
+	def __tls_options(self):
+		pki_dir = os.path.dirname(os.path.abspath(__file__)) + "/pki"
+		return ["--tls", "--tls-no-cn-verify",
+			"--tls-key", pki_dir + "/key.pem",
+			"--tls-cert", pki_dir + "/cert.pem",
+			"--tls-cacert", pki_dir + "/cacert.pem"]
 
 	def __ddir(self):
 		return os.path.join(self.__dump_path, "%d" % self.__iter)
@@ -1045,7 +1072,10 @@ class criu:
 			os.close(status_fds[1])
 			if os.read(status_fds[0], 1) != b'\0':
 				ret = ret.wait()
-				raise test_fail_exc("criu %s exited with %s" % (action, ret))
+				if self.__test.blocking():
+					raise test_fail_expected_exc(action)
+				else:
+					raise test_fail_exc("criu %s exited with %s" % (action, ret))
 			os.close(status_fds[0])
 			return ret
 
@@ -1077,13 +1107,35 @@ class criu:
 			else:
 				raise test_fail_exc("CRIU %s" % action)
 
+	def __stats_file(self, action):
+		return os.path.join(self.__ddir(), "stats-%s" % action)
+
 	def show_stats(self, action):
 		if not self.__show_stats:
 			return
 
-		subprocess.Popen([self.__crit_bin, "show",
-				os.path.join(self.__dump_path,
-				str(self.__iter), "stats-%s" % action)]).wait()
+		subprocess.Popen([self.__crit_bin, "show", self.__stats_file(action)]).wait()
+
+	def check_pages_counts(self):
+		if not os.access(self.__stats_file("dump"), os.R_OK):
+			return
+
+		stats_written = -1
+		with open(self.__stats_file("dump"), 'rb') as stfile:
+			stats = crpc.images.load(stfile)
+			stent = stats['entries'][0]['dump']
+			stats_written = int(stent['shpages_written']) + int(stent['pages_written'])
+
+		real_written = 0
+		for f in os.listdir(self.__ddir()):
+			if f.startswith('pages-'):
+				real_written += os.path.getsize(os.path.join(self.__ddir(), f))
+
+		r_pages = real_written / 4096
+		r_off = real_written % 4096
+		if (stats_written != r_pages) or (r_off != 0):
+			print("ERROR: bad page counts, stats = %d real = %d(%d)" % (stats_written, r_pages, r_off))
+			raise test_fail_exc("page counts mismatch")
 
 	def dump(self, action, opts = []):
 		self.__iter += 1
@@ -1098,14 +1150,35 @@ class criu:
 		if self.__page_server:
 			print("Adding page server")
 
-			ps_opts = ["--port", "12345"]
+			ps_opts = ["--port", "12345"] + self.__tls
 			if self.__dedup:
 				ps_opts += ["--auto-dedup"]
 
 			self.__page_server_p = self.__criu_act("page-server", opts = ps_opts, nowait = True)
-			a_opts += ["--page-server", "--address", "127.0.0.1", "--port", "12345"]
+			a_opts += ["--page-server", "--address", "127.0.0.1", "--port", "12345"] + self.__tls
 
 		a_opts += self.__test.getdopts()
+
+		if self.__remote:
+			logdir = os.getcwd() + "/" + self.__dump_path + "/" + str(self.__iter)
+			print("Adding image cache")
+
+			cache_opts = [self.__criu_bin, "image-cache", "--port", "12345", "-v4", "-o",
+				      logdir + "/image-cache.log", "-D", logdir]
+
+			subprocess.Popen(cache_opts).pid
+			time.sleep(1)
+
+			print("Adding image proxy")
+
+			proxy_opts = [self.__criu_bin, "image-proxy", "--port", "12345", "--address",
+					"localhost", "-v4", "-o", logdir + "/image-proxy.log",
+					"-D", logdir]
+
+			subprocess.Popen(proxy_opts).pid
+			time.sleep(1)
+
+			a_opts += ["--remote"]
 
 		if self.__dedup:
 			a_opts += ["--auto-dedup"]
@@ -1123,14 +1196,15 @@ class criu:
 			a_opts += ['--empty-ns', 'net']
 
 		nowait = False
-		if self.__lazy_migrate:
-			a_opts += ["--lazy-pages", "--port", "12345"]
+		if self.__lazy_migrate and action == "dump":
+			a_opts += ["--lazy-pages", "--port", "12345"] + self.__tls
 			nowait = True
 		self.__dump_process = self.__criu_act(action, opts = a_opts + opts, nowait = nowait)
 		if self.__mdedup and self.__iter > 1:
 			self.__criu_act("dedup", opts = [])
 
 		self.show_stats("dump")
+		self.check_pages_counts()
 
 		if self.__leave_stopped:
 			pstree_check_stopped(self.__test.getpid())
@@ -1156,6 +1230,9 @@ class criu:
 			r_opts += ['--empty-ns', 'net']
 			r_opts += ['--action-script', os.getcwd() + '/empty-netns-prep.sh']
 
+		if self.__remote:
+			r_opts += ["--remote"]
+
 		if self.__dedup:
 			r_opts += ["--auto-dedup"]
 
@@ -1168,10 +1245,12 @@ class criu:
 		if self.__lazy_pages or self.__lazy_migrate:
 			lp_opts = []
 			if self.__remote_lazy_pages or self.__lazy_migrate:
-				lp_opts += ['--page-server', "--port", "12345", "--address", "127.0.0.1"]
+				lp_opts += ["--page-server", "--port", "12345",
+					    "--address", "127.0.0.1"] + self.__tls
+
 			if self.__remote_lazy_pages:
 				ps_opts = ["--pidfile", "ps.pid",
-					   "--port", "12345", "--lazy-pages"]
+					   "--port", "12345", "--lazy-pages"] + self.__tls
 				self.__page_server_p = self.__criu_act("page-server", opts = ps_opts, nowait = True)
 			self.__lazy_pages_p = self.__criu_act("lazy-pages", opts = lp_opts, nowait = True)
 			r_opts += ["--lazy-pages"]
@@ -1334,7 +1413,7 @@ def get_visible_state(test):
 
 		cmounts = []
 		try:
-			r = re.compile(r"^\S+\s\S+\s\S+\s(\S+)\s(\S+)\s\S+\s[^-]*?(shared)?[^-]*?(master)?[^-]*?-")
+			r = re.compile(r"^\S+\s\S+\s\S+\s(\S+)\s(\S+)\s(\S+)\s[^-]*?(shared)?[^-]*?(master)?[^-]*?-")
 			with open("/proc/%s/root/proc/%s/mountinfo" % (test.getpid(), pid)) as mountinfo:
 				for m in mountinfo:
 					cmounts.append(r.match(m).groups())
@@ -1672,7 +1751,7 @@ class Launcher:
 		nd = ('nocr', 'norst', 'pre', 'iters', 'page_server', 'sibling', 'stop', 'empty_ns',
 				'fault', 'keep_img', 'report', 'snaps', 'sat', 'script', 'rpc', 'lazy_pages',
 				'join_ns', 'dedup', 'sbs', 'freezecg', 'user', 'dry_run', 'noauto_dedup',
-				'remote_lazy_pages', 'show_stats', 'lazy_migrate',
+				'remote_lazy_pages', 'show_stats', 'lazy_migrate', 'remote', 'tls',
 				'criu_bin', 'crit_bin')
 		arg = repr((name, desc, flavor, {d: self.__opts[d] for d in nd}))
 
@@ -1737,7 +1816,7 @@ class Launcher:
 
 			if sub['log']:
 				with open(sub['log']) as sublog:
-					print(sublog.read().encode('ascii', 'ignore'))
+					print("%s" % sublog.read().encode('ascii', 'ignore').decode('utf-8'))
 				os.unlink(sub['log'])
 
 			return True
@@ -2225,6 +2304,7 @@ rp.add_argument("--user", help = "Run CRIU as regular user", action = 'store_tru
 rp.add_argument("--rpc", help = "Run CRIU via RPC rather than CLI", action = 'store_true')
 
 rp.add_argument("--page-server", help = "Use page server dump", action = 'store_true')
+rp.add_argument("--remote", help = "Use remote option for diskless C/R", action = 'store_true')
 rp.add_argument("-p", "--parallel", help = "Run test in parallel")
 rp.add_argument("--dry-run", help="Don't run tests, just pretend to", action='store_true')
 rp.add_argument("--script", help="Add script to get notified by criu")
@@ -2236,6 +2316,7 @@ rp.add_argument("--ignore-taint", help = "Don't care about a non-zero kernel tai
 rp.add_argument("--lazy-pages", help = "restore pages on demand", action = 'store_true')
 rp.add_argument("--lazy-migrate", help = "restore pages on demand", action = 'store_true')
 rp.add_argument("--remote-lazy-pages", help = "simulate lazy migration", action = 'store_true')
+rp.add_argument("--tls", help = "use TLS for migration", action = 'store_true')
 rp.add_argument("--title", help = "A test suite title", default = "criu")
 rp.add_argument("--show-stats", help = "Show criu statistics", action = 'store_true')
 rp.add_argument("--criu-bin", help = "Path to criu binary", default = '../criu/criu')

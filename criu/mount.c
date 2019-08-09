@@ -7,7 +7,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/mount.h>
-#include <sys/types.h>
 #include <sys/wait.h>
 #include <sched.h>
 
@@ -492,14 +491,13 @@ static int try_resolve_ext_mount(struct mount_info *info)
 			int len;
 
 			len = strlen(val) + sizeof("dev[]");
-			source = xmalloc(len);
+			source = xrealloc(info->source, len);
 			if (source == NULL)
 				return -1;
 
 			snprintf(source, len, "dev[%s]", val);
 			info->fstype = fstype_auto();
 			BUG_ON(info->fstype->code != FSTYPE__AUTO);
-			xfree(info->source);
 			info->source = source;
 			return 1;
 		}
@@ -1152,17 +1150,29 @@ static int get_clean_fd(struct mount_info *mi)
  * root of our mount namespace as it is covered by other mount.
  * mnt_is_overmounted() checks if mount is not visible.
  */
-static bool mnt_is_overmounted(struct mount_info *mi)
+bool mnt_is_overmounted(struct mount_info *mi)
 {
 	struct mount_info *t, *c, *m = mi;
 
+	if (mi->is_overmounted != -1)
+		goto exit;
+
+	mi->is_overmounted = 0;
+
 	while (m->parent) {
+		if (mi->parent->is_overmounted == 1) {
+			mi->is_overmounted = 1;
+			goto exit;
+		}
+
 		/* Check there is no sibling-overmount */
 		list_for_each_entry(t, &m->parent->children, siblings) {
 			if (m == t)
 				continue;
-			if (issubpath(m->mountpoint, t->mountpoint))
-				return true;
+			if (issubpath(m->mountpoint, t->mountpoint)) {
+				mi->is_overmounted = 1;
+				goto exit;
+			}
 		}
 
 		/*
@@ -1175,10 +1185,19 @@ static bool mnt_is_overmounted(struct mount_info *mi)
 
 	/* Check there is no children-overmount */
 	list_for_each_entry(c, &mi->children, siblings)
-		if (!strcmp(c->mountpoint, mi->mountpoint))
-			return true;
+		if (!strcmp(c->mountpoint, mi->mountpoint)) {
+			mi->is_overmounted = 1;
+			goto exit;
+		}
 
-	return false;
+exit:
+	return mi->is_overmounted;
+}
+
+static int set_is_overmounted(struct mount_info *mi)
+{
+	mnt_is_overmounted(mi);
+	return 0;
 }
 
 /*
@@ -2306,8 +2325,8 @@ out:
 	 * mi->shared_id && !shared - create a new shared group
 	 */
 	if (restore_shared_options(mi, private,
-	                           mi->shared_id && !shared,
-	                           mi->master_id && !master))
+				   mi->shared_id && !shared,
+				   mi->master_id && !master))
 		return -1;
 
 	mi->mounted = true;
@@ -2723,6 +2742,7 @@ struct mount_info *mnt_entry_alloc()
 	new = xzalloc(sizeof(struct mount_info));
 	if (new) {
 		new->fd = -1;
+		new->is_overmounted = -1;
 		INIT_LIST_HEAD(&new->children);
 		INIT_LIST_HEAD(&new->siblings);
 		INIT_LIST_HEAD(&new->mnt_slave_list);
@@ -3008,7 +3028,7 @@ int mntns_maybe_create_roots(void)
 	return create_mnt_roots();
 }
 
-static int do_restore_task_mnt_ns(struct ns_id *nsid, struct pstree_item *current)
+static int do_restore_task_mnt_ns(struct ns_id *nsid)
 {
 	int fd;
 
@@ -3055,7 +3075,7 @@ int restore_task_mnt_ns(struct pstree_item *current)
 
 		BUG_ON(nsid->type == NS_CRIU);
 
-		if (do_restore_task_mnt_ns(nsid, current))
+		if (do_restore_task_mnt_ns(nsid))
 			return -1;
 	}
 
@@ -3160,6 +3180,8 @@ static int populate_mnt_ns(void)
 	if (validate_mounts(mntinfo, false))
 		return -1;
 
+	mnt_tree_for_each(pms, set_is_overmounted);
+
 	if (find_remap_mounts(pms))
 		return -1;
 
@@ -3180,7 +3202,7 @@ static int populate_mnt_ns(void)
 	return ret;
 }
 
-int __depopulate_roots_yard(void)
+static int __depopulate_roots_yard(void)
 {
 	int ret = 0;
 
@@ -3264,13 +3286,10 @@ int depopulate_roots_yard(int mntns_fd, bool only_ghosts)
 
 void cleanup_mnt_ns(void)
 {
-	char path[PATH_MAX], *root = opts.root ? : "/";
-
 	if (mnt_roots == NULL)
 		return;
 
-	snprintf(path, sizeof(path), "%s/%s", root, mnt_roots);
-	if (rmdir(path))
+	if (rmdir(mnt_roots))
 		pr_perror("Can't remove the directory %s", mnt_roots);
 }
 
@@ -3658,3 +3677,146 @@ void clean_cr_time_mounts(void)
 }
 
 struct ns_desc mnt_ns_desc = NS_DESC_ENTRY(CLONE_NEWNS, "mnt");
+
+static int call_helper_process(int (*call)(void *), void *arg)
+{
+	int pid, status;
+
+	pid = clone_noasan(call, CLONE_VFORK | CLONE_VM | CLONE_FILES |
+			   CLONE_IO | CLONE_SIGHAND | CLONE_SYSVSEM, arg);
+	if (pid == -1) {
+		pr_perror("Can't clone helper process");
+		return -1;
+	}
+
+	errno = 0;
+	if (waitpid(pid, &status, __WALL) != pid) {
+		pr_perror("Unable to wait %d", pid);
+		return -1;
+	}
+
+	if (status) {
+		pr_err("Bad child exit status: %d\n", status);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int ns_remount_writable(void *arg)
+{
+	struct mount_info *mi = (struct mount_info *)arg;
+	struct ns_id *ns = mi->nsid;
+
+	if (do_restore_task_mnt_ns(ns))
+		return 1;
+	pr_debug("Switched to mntns %u:%u/n", ns->id, ns->kid);
+
+	if (mount(NULL, mi->ns_mountpoint, NULL, MS_REMOUNT | MS_BIND |
+		  (mi->flags & ~(MS_PROPAGATE | MS_RDONLY)), NULL) == -1) {
+		pr_perror("Failed to remount %d:%s writable", mi->mnt_id, mi->mountpoint);
+		return 1;
+	}
+	return 0;
+}
+
+int try_remount_writable(struct mount_info *mi, bool ns)
+{
+	int remounted = REMOUNTED_RW;
+
+	/* Don't remount if we are in host mntns to be on the safe side */
+	if (!(root_ns_mask & CLONE_NEWNS))
+		return 0;
+
+	if (!ns)
+		remounted = REMOUNTED_RW_SERVICE;
+
+	if (mi->flags & MS_RDONLY && !(mi->remounted_rw & remounted)) {
+		if (mnt_is_overmounted(mi)) {
+			pr_err("The mount %d is overmounted so paths are invisible\n", mi->mnt_id);
+			return -1;
+		}
+
+		/* There should be no ghost files on mounts with ro sb */
+		if (mi->sb_flags & MS_RDONLY) {
+			pr_err("The mount %d has readonly sb\n", mi->mnt_id);
+			return -1;
+		}
+
+		pr_info("Remount %d:%s writable\n", mi->mnt_id, mi->mountpoint);
+		if (!ns) {
+			if (mount(NULL, mi->mountpoint, NULL, MS_REMOUNT | MS_BIND |
+				  (mi->flags & ~(MS_PROPAGATE | MS_RDONLY)), NULL) == -1) {
+				pr_perror("Failed to remount %d:%s writable", mi->mnt_id, mi->mountpoint);
+				return -1;
+			}
+		} else {
+			if (call_helper_process(ns_remount_writable, mi))
+				return -1;
+		}
+		mi->remounted_rw |= remounted;
+	}
+
+	return 0;
+}
+
+static int __remount_readonly_mounts(struct ns_id *ns)
+{
+	struct mount_info *mi;
+	bool mntns_set = false;
+
+	for (mi = mntinfo; mi; mi = mi->next) {
+		if (ns && mi->nsid != ns)
+			continue;
+
+		if (!(mi->remounted_rw && REMOUNTED_RW))
+			continue;
+
+		/*
+		 * Lets enter the mount namespace lazily, only if we've found the
+		 * mount which should be remounted readonly. These saves us
+		 * from entering mntns if we have no mounts to remount in it.
+		 */
+		if (ns && !mntns_set) {
+			if (do_restore_task_mnt_ns(ns))
+				return -1;
+			mntns_set = true;
+			pr_debug("Switched to mntns %u:%u/n", ns->id, ns->kid);
+		}
+
+		pr_info("Remount %d:%s back to readonly\n", mi->mnt_id, mi->mountpoint);
+		if (mount(NULL, mi->ns_mountpoint, NULL,
+			  MS_REMOUNT | MS_BIND | (mi->flags & ~MS_PROPAGATE),
+			  NULL)) {
+			pr_perror("Failed to restore %d:%s mount flags %x",
+				  mi->mnt_id, mi->mountpoint, mi->flags);
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+static int ns_remount_readonly_mounts(void *arg)
+{
+	struct ns_id *nsid;
+
+	for (nsid = ns_ids; nsid != NULL; nsid = nsid->next) {
+		if (nsid->nd != &mnt_ns_desc)
+			continue;
+
+		if (__remount_readonly_mounts(nsid))
+			return 1;
+	}
+
+	return 0;
+}
+
+int remount_readonly_mounts(void)
+{
+	/*
+	 * Need a helper process because the root task can share fs via
+	 * CLONE_FS and we would not be able to enter mount namespaces
+	 */
+	return call_helper_process(ns_remount_readonly_mounts, NULL);
+}

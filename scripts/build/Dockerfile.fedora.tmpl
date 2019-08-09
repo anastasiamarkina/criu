@@ -6,6 +6,7 @@ RUN dnf install -y \
 	findutils \
 	gcc \
 	git \
+	gnutls-devel \
 	iproute \
 	iptables \
 	libaio-devel \
@@ -33,7 +34,8 @@ RUN dnf install -y \
 	tar \
 	which \
 	e2fsprogs \
-	asciidoc xmlto
+	rubygem-asciidoctor \
+	kmod
 
 # Replace coreutils-single with "traditional" coreutils
 # to fix the following error on Fedora 28/rawhide while

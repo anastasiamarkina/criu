@@ -894,7 +894,7 @@ static int restore_tty_params(int fd, struct tty_info *info)
 		}
 	}
 
-	return userns_call(do_restore_tty_parms, UNS_ASYNC, &p, sizeof(p), fd);
+	return userns_call(do_restore_tty_parms, 0, &p, sizeof(p), fd);
 }
 
 /*
@@ -997,7 +997,8 @@ static int pty_open_unpaired_slave(struct file_desc *d, struct tty_info *slave)
 				goto err;
 			}
 
-			unlock_pty(master);
+			if (unlock_pty(master))
+				goto err;
 
 			if (opts.orphan_pts_master &&
 			    rpc_send_fd(ACT_ORPHAN_PTS_MASTER, master) == 0) {
@@ -1036,7 +1037,8 @@ static int pty_open_unpaired_slave(struct file_desc *d, struct tty_info *slave)
 			goto err;
 		}
 
-		unlock_pty(master);
+		if (unlock_pty(master))
+			goto err;
 
 		fd = open_tty_reg(slave->reg_d, slave->tfe->flags);
 		if (fd < 0) {
@@ -1068,10 +1070,15 @@ out:
 		 * the process which keeps the master peer.
 		 */
 		if (root_item->sid != vpid(root_item)) {
-			pr_debug("Restore inherited group %d\n",
-				 getpgid(getppid()));
-			if (tty_set_prgp(fd, getpgid(getppid())))
-				goto err;
+			if (root_item->pgid == vpid(root_item)) {
+				if (tty_set_prgp(fd, root_item->pgid))
+					goto err;
+			} else {
+				pr_debug("Restore inherited group %d\n",
+					getpgid(getppid()));
+				if (tty_set_prgp(fd, getpgid(getppid())))
+					goto err;
+			}
 		}
 	}
 
@@ -1098,7 +1105,8 @@ static int pty_open_ptmx(struct tty_info *info)
 		return -1;
 	}
 
-	unlock_pty(master);
+	if (unlock_pty(master))
+		goto err;
 
 	if (restore_tty_params(master, info))
 		goto err;

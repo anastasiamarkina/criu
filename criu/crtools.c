@@ -3,7 +3,6 @@
 #include <limits.h>
 #include <unistd.h>
 #include <errno.h>
-#include <getopt.h>
 #include <string.h>
 #include <ctype.h>
 #include <sched.h>
@@ -20,9 +19,6 @@
 #include <dlfcn.h>
 
 #include <sys/utsname.h>
-
-#include <sys/time.h>
-#include <sys/resource.h>
 
 #include "int.h"
 #include "page.h"
@@ -45,20 +41,12 @@
 #include "cgroup.h"
 #include "cpu.h"
 #include "fault-injection.h"
-#include "lsm.h"
 #include "proc_parse.h"
 #include "kerndat.h"
 
 #include "setproctitle.h"
 #include "sysctl.h"
-
-static int early_init(void)
-{
-	if (init_service_fd())
-		return 1;
-
-	return 0;
-}
+#include "img-remote.h"
 
 int main(int argc, char *argv[], char *envp[])
 {
@@ -95,9 +83,6 @@ int main(int argc, char *argv[], char *envp[])
 
 	log_set_loglevel(opts.log_level);
 
-	if (early_init())
-		return -1;
-
 	if (!strcmp(argv[1], "swrk")) {
 		if (argc < 3)
 			goto usage;
@@ -111,29 +96,8 @@ int main(int argc, char *argv[], char *envp[])
 		return cr_service_work(atoi(argv[2]));
 	}
 
-	if (opts.deprecated_ok)
-		pr_msg("Turn deprecated stuff ON\n");
-	if (opts.tcp_skip_in_flight)
-		pr_msg("Will skip in-flight TCP connections\n");
-	if (opts.tcp_established_ok)
-		pr_info("Will dump TCP connections\n");
-	if (opts.link_remap_ok)
-		pr_info("Will allow link remaps on FS\n");
-	if (opts.weak_sysctls)
-		pr_msg("Will skip non-existant sysctls on restore\n");
-
-	if (getenv("CRIU_DEPRECATED")) {
-		pr_msg("Turn deprecated stuff ON via env\n");
-		opts.deprecated_ok = true;
-	}
-
-	if (check_namespace_opts()) {
-		pr_msg("Error: namespace flags conflict\n");
-		return 1;
-	}
-
-	if (!opts.restore_detach && opts.restore_sibling) {
-		pr_msg("--restore-sibling only makes sense with --restore-detach\n");
+	if (check_options()) {
+		flush_early_log_buffer(STDERR_FILENO);
 		return 1;
 	}
 
@@ -146,11 +110,6 @@ int main(int argc, char *argv[], char *envp[])
 	if (optind >= argc) {
 		pr_msg("Error: command is required\n");
 		goto usage;
-	}
-
-	if (!strcmp(argv[optind], "exec")) {
-		pr_msg("The \"exec\" action is deprecated by the Compel library.\n");
-		return -1;
 	}
 
 	has_sub_command = (argc - optind) > 1;
@@ -238,6 +197,11 @@ int main(int argc, char *argv[], char *envp[])
 		if (!opts.tree_id)
 			goto opt_pid_missing;
 
+		if (opts.lazy_pages) {
+			pr_err("Cannot pre-dump with --lazy-pages\n");
+			return 1;
+		}
+
 		return cr_pre_dump_tasks(opts.tree_id) != 0;
 	}
 
@@ -256,12 +220,6 @@ int main(int argc, char *argv[], char *envp[])
 		return ret != 0;
 	}
 
-	if (!strcmp(argv[optind], "show")) {
-		pr_msg("The \"show\" action is deprecated by the CRIT utility.\n");
-		pr_msg("To view an image use the \"crit decode -i $name --pretty\" command.\n");
-		return -1;
-	}
-
 	if (!strcmp(argv[optind], "lazy-pages"))
 		return cr_lazy_pages(opts.daemon_mode) != 0;
 
@@ -270,6 +228,22 @@ int main(int argc, char *argv[], char *envp[])
 
 	if (!strcmp(argv[optind], "page-server"))
 		return cr_page_server(opts.daemon_mode, false, -1) != 0;
+
+	if (!strcmp(argv[optind], "image-cache")) {
+		if (!opts.port)
+			goto opt_port_missing;
+		return image_cache(opts.daemon_mode, DEFAULT_CACHE_SOCKET);
+	}
+
+	if (!strcmp(argv[optind], "image-proxy")) {
+		if (!opts.addr) {
+			pr_msg("Error: address not specified\n");
+			return 1;
+		}
+		if (!opts.port)
+			goto opt_port_missing;
+		return image_proxy(opts.daemon_mode, DEFAULT_PROXY_SOCKET);
+	}
 
 	if (!strcmp(argv[optind], "service"))
 		return cr_service(opts.daemon_mode);
@@ -288,6 +262,17 @@ int main(int argc, char *argv[], char *envp[])
 			return cpuinfo_check();
 	}
 
+	if (!strcmp(argv[optind], "exec")) {
+		pr_msg("The \"exec\" action is deprecated by the Compel library.\n");
+		return -1;
+	}
+
+	if (!strcmp(argv[optind], "show")) {
+		pr_msg("The \"show\" action is deprecated by the CRIT utility.\n");
+		pr_msg("To view an image use the \"crit decode -i $name --pretty\" command.\n");
+		return -1;
+	}
+
 	pr_msg("Error: unknown command: %s\n", argv[optind]);
 usage:
 	pr_msg("\n"
@@ -299,6 +284,8 @@ usage:
 "  criu service [<options>]\n"
 "  criu dedup\n"
 "  criu lazy-pages -D DIR [<options>]\n"
+"  criu image-cache [<options>]\n"
+"  criu image-proxy [<options>]\n"
 "\n"
 "Commands:\n"
 "  dump           checkpoint a process/tree identified by pid\n"
@@ -310,6 +297,8 @@ usage:
 "  dedup          remove duplicates in memory dump\n"
 "  cpuinfo dump   writes cpu information into image file\n"
 "  cpuinfo check  validates cpu information read from image file\n"
+"  image-proxy    launch dump-side proxy to sent images\n"
+"  image-cache    launch restore-side cache to receive images\n"
 	);
 
 	if (usage_error) {
@@ -362,6 +351,8 @@ usage:
 "                            macvlan[IFNAME]:OUTNAME\n"
 "                            mnt[COOKIE]:ROOT\n"
 "\n"
+"  --remote              dump/restore images directly to/from remote node using\n"
+"                        image-proxy/image-cache\n"
 "* Special resources support:\n"
 "     --" SK_EST_PARAM "  checkpoint/restore established TCP connections\n"
 "     --" SK_INFLIGHT_PARAM "   skip (ignore) in-flight TCP connections\n"
@@ -379,7 +370,8 @@ usage:
 "  --irmap-scan-path FILE\n"
 "                        add a path the irmap hints to scan\n"
 "  --manage-cgroups [m]  dump/restore process' cgroups; argument can be one of\n"
-"                        'none', 'props', 'soft' (default), 'full' or 'strict'\n"
+"                        'none', 'props', 'soft' (default), 'full', 'strict'\n"
+"                        or 'ignore'\n"
 "  --cgroup-root [controller:]/newroot\n"
 "                        on dump: change the root for the controller that will\n"
 "                        be dumped. By default, only the paths with tasks in\n"
@@ -397,6 +389,9 @@ usage:
 "  --cgroup-dump-controller NAME\n"
 "                        define cgroup controller to be dumped\n"
 "                        and skip anything else present in system\n"
+"  --lsm-profile TYPE:NAME\n"
+"                        Specify an LSM profile to be used during restore.\n"
+"                        The type can be either 'apparmor' or 'selinux'.\n"
 "  --skip-mnt PATH       ignore this mountpoint when dumping the mount namespace\n"
 "  --enable-fs FSNAMES   a comma separated list of filesystem names or \"all\"\n"
 "                        force criu to (try to) dump/restore these filesystem's\n"
@@ -455,6 +450,12 @@ usage:
 "  -d|--daemon           run in the background after creating socket\n"
 "  --status-fd FD        write \\0 to the FD and close it once process is ready\n"
 "                        to handle requests\n"
+"  --tls-cacert FILE     trust certificates signed only by this CA\n"
+"  --tls-cacrl FILE      path to CA certificate revocation list file\n"
+"  --tls-cert FILE       path to TLS certificate file\n"
+"  --tls-key FILE        path to TLS private key file\n"
+"  --tls                 use TLS to secure remote connection\n"
+"  --tls-no-cn-verify    do not verify common name in server certificate\n"
 "\n"
 "Configuration file options:\n"
 "  --config FILEPATH     pass a specific configuration file\n"
@@ -466,6 +467,10 @@ usage:
 	);
 
 	return 0;
+
+opt_port_missing:
+	pr_msg("Error: port not specified\n");
+	return 1;
 
 opt_pid_missing:
 	pr_msg("Error: pid not specified\n");

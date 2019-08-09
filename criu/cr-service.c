@@ -37,8 +37,6 @@
 #include "irmap.h"
 #include "kerndat.h"
 #include "proc_parse.h"
-#include <sys/un.h>
-#include <sys/socket.h>
 #include "common/scm.h"
 #include "uffd.h"
 
@@ -269,48 +267,58 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	 * overwrites all options set via RPC.
 	 */
 	if (req->config_file) {
-		char *tmp_output = NULL;
-		char *tmp_work = NULL;
-		char *tmp_imgs = NULL;
+		char *tmp_output = opts.output;
+		char *tmp_work = opts.work_dir;
+		char *tmp_imgs = opts.imgs_dir;
 
-		if (opts.output)
-			tmp_output = xstrdup(opts.output);
-		if (opts.work_dir)
-			tmp_work = xstrdup(opts.work_dir);
-		if (opts.imgs_dir)
-			tmp_imgs = xstrdup(opts.imgs_dir);
-		xfree(opts.output);
-		xfree(opts.work_dir);
-		xfree(opts.imgs_dir);
 		opts.output = NULL;
 		opts.work_dir = NULL;
 		opts.imgs_dir = NULL;
+
 		rpc_cfg_file = req->config_file;
 		i = parse_options(0, NULL, &dummy, &dummy, PARSING_RPC_CONF);
-		pr_warn("parse_options returns %d\n", i);
 		if (i) {
 			xfree(tmp_output);
 			xfree(tmp_work);
 			xfree(tmp_imgs);
 			goto err;
 		}
-		if (tmp_output && opts.output && !strncmp(tmp_output, opts.output, PATH_MAX))
+		/* If this is non-NULL, the RPC configuration file had a value, use it.*/
+		if (opts.output)
 			output_changed_by_rpc_conf = true;
-		if (tmp_work && opts.work_dir && !strncmp(tmp_work, opts.work_dir, PATH_MAX))
+		/* If this is NULL, use the old value if it was set. */
+		if (!opts.output && tmp_output) {
+			opts.output = tmp_output;
+			tmp_output = NULL;
+		}
+
+		if (opts.work_dir)
 			work_changed_by_rpc_conf = true;
-		if (tmp_imgs && opts.imgs_dir && !strncmp(tmp_imgs, opts.imgs_dir, PATH_MAX))
+		if (!opts.work_dir && tmp_work) {
+			opts.work_dir = tmp_work;
+			tmp_work = NULL;
+		}
+
+		if (opts.imgs_dir)
 			imgs_changed_by_rpc_conf = true;
+		/*
+		 * As the images directory is a required RPC setting, it is not
+		 * necessary to use the value from other configuration files.
+		 * Either it is set in the RPC configuration file or it is set
+		 * via RPC.
+		 */
 		xfree(tmp_output);
 		xfree(tmp_work);
 		xfree(tmp_imgs);
 	}
 
 	/*
-	 * open images_dir
+	 * open images_dir - images_dir_fd is a required RPC parameter
+	 *
 	 * This assumes that if opts.imgs_dir is set we have a value
 	 * from the configuration file parser. The test to see that
 	 * imgs_changed_by_rpc_conf is true is used to make sure the value
-	 * is not the same as from one of the other configuration files.
+	 * is from the RPC configuration file.
 	 * The idea is that only the RPC configuration file is able to
 	 * overwrite RPC settings:
 	 *  * apply_config(global_conf)
@@ -319,7 +327,7 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	 *  * apply_rpc_options()
 	 *  * apply_config(rpc_conf)
 	 */
-	if (opts.imgs_dir && imgs_changed_by_rpc_conf)
+	if (imgs_changed_by_rpc_conf)
 		strncpy(images_dir_path, opts.imgs_dir, PATH_MAX - 1);
 	else
 		sprintf(images_dir_path, "/proc/%d/fd/%d", ids.pid, req->images_dir_fd);
@@ -339,11 +347,17 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	}
 
 	/* chdir to work dir */
-	if (opts.work_dir && work_changed_by_rpc_conf)
+	if (work_changed_by_rpc_conf)
+		/* Use the value from the RPC configuration file first. */
 		strncpy(work_dir_path, opts.work_dir, PATH_MAX - 1);
 	else if (req->has_work_dir_fd)
+		/* Use the value set via RPC. */
 		sprintf(work_dir_path, "/proc/%d/fd/%d", ids.pid, req->work_dir_fd);
+	else if (opts.work_dir)
+		/* Use the value from one of the other configuration files. */
+		strncpy(work_dir_path, opts.work_dir, PATH_MAX - 1);
 	else
+		/* Use the images directory a work directory. */
 		strcpy(work_dir_path, images_dir_path);
 
 	if (chdir(work_dir_path)) {
@@ -352,7 +366,11 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	}
 
 	/* initiate log file in work dir */
-	if (req->log_file && !(opts.output  && output_changed_by_rpc_conf)) {
+	if (req->log_file && !output_changed_by_rpc_conf) {
+		/*
+		 * If RPC sets a log file and if there nothing from the
+		 * RPC configuration file, use the RPC value.
+		 */
 		if (strchr(req->log_file, '/')) {
 			pr_perror("No subdirs are allowed in log_file name");
 			goto err;
@@ -369,6 +387,10 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	if (log_init(opts.output) == -1) {
 		pr_perror("Can't initiate log");
 		goto err;
+	}
+
+	if (req->config_file) {
+		pr_debug("Overwriting RPC settings with values from %s\n", req->config_file);
 	}
 
 	if (kerndat_init())
@@ -413,6 +435,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 
 	if (req->has_tcp_skip_in_flight)
 		opts.tcp_skip_in_flight = req->tcp_skip_in_flight;
+
+	if (req->has_tcp_close)
+		opts.tcp_close = req->tcp_close;
 
 	if (req->has_weak_sysctls)
 		opts.weak_sysctls = req->weak_sysctls;
@@ -564,6 +589,11 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	if (req->freeze_cgroup)
 		SET_CHAR_OPTS(freeze_cgroup, req->freeze_cgroup);
 
+	if (req->lsm_profile) {
+		opts.lsm_supplied = true;
+		SET_CHAR_OPTS(lsm_profile, req->lsm_profile);
+	}
+
 	if (req->has_timeout)
 		opts.timeout = req->timeout;
 
@@ -577,6 +607,19 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		if (!cgp_add_dump_controller(req->cgroup_dump_controller[i]))
 			goto err;
 	}
+
+	if (req->tls_cacert)
+		SET_CHAR_OPTS(tls_cacert, req->tls_cacert);
+	if (req->tls_cacrl)
+		SET_CHAR_OPTS(tls_cacrl, req->tls_cacrl);
+	if (req->tls_cert)
+		SET_CHAR_OPTS(tls_cert, req->tls_cert);
+	if (req->tls_key)
+		SET_CHAR_OPTS(tls_key, req->tls_key);
+	if (req->tls)
+		opts.tls = req->tls;
+	if (req->tls_no_cn_verify)
+		opts.tls_no_cn_verify = req->tls_no_cn_verify;
 
 	if (req->has_auto_ext_mnt)
 		opts.autodetect_ext_mounts = req->auto_ext_mnt;
@@ -613,8 +656,6 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	if (req->orphan_pts_master)
 		opts.orphan_pts_master = true;
 
-	if (check_namespace_opts())
-		goto err;
 
 	/* Evaluate additional configuration file a second time to overwrite
 	 * all RPC settings. */
@@ -624,7 +665,10 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		if (i)
 			goto err;
 	}
+
 	log_set_loglevel(opts.log_level);
+	if (check_options())
+		goto err;
 
 	return 0;
 
@@ -938,8 +982,8 @@ static int handle_version(int sk, CriuReq * msg)
 	CriuVersion version = CRIU_VERSION__INIT;
 
 	/* This assumes we will always have a major and minor version */
-	version.major = CRIU_VERSION_MAJOR;
-	version.minor = CRIU_VERSION_MINOR;
+	version.major_number = CRIU_VERSION_MAJOR;
+	version.minor_number = CRIU_VERSION_MINOR;
 	if (strcmp(CRIU_GITID, "0")) {
 		version.gitid = CRIU_GITID;
 	}
@@ -1125,7 +1169,7 @@ int cr_service_work(int sk)
 	CriuReq *msg = 0;
 
 more:
-	if (recv_criu_msg(sk, &msg) == -1) {
+	if (recv_criu_msg(sk, &msg) != 0) {
 		pr_perror("Can't recv request");
 		goto err;
 	}
@@ -1271,7 +1315,8 @@ int cr_service(bool daemon_mode)
 			SET_CHAR_OPTS(addr, CR_DEFAULT_SERVICE_ADDRESS);
 		}
 
-		strcpy(server_addr.sun_path, opts.addr);
+		strncpy(server_addr.sun_path, opts.addr,
+				sizeof(server_addr.sun_path) - 1);
 
 		server_addr_len = strlen(server_addr.sun_path)
 				+ sizeof(server_addr.sun_family);

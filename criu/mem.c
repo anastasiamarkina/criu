@@ -101,7 +101,6 @@ static inline bool __page_in_parent(bool dirty)
 
 bool should_dump_page(VmaEntry *vmae, u64 pme)
 {
-#ifdef CONFIG_VDSO
 	/*
 	 * vDSO area must be always dumped because on restore
 	 * we might need to generate a proxy.
@@ -117,7 +116,7 @@ bool should_dump_page(VmaEntry *vmae, u64 pme)
 	 */
 	if (vma_entry_is(vmae, VMA_AREA_VVAR))
 		return false;
-#endif
+
 	/*
 	 * Optimisation for private mapping pages, that haven't
 	 * yet being COW-ed
@@ -149,7 +148,7 @@ static bool is_stack(struct pstree_item *item, unsigned long vaddr)
 	for (i = 0; i < item->nr_threads; i++) {
 		uint64_t sp = dmpi(item)->thread_sp[i];
 
-		if (!((sp ^ vaddr) & PAGE_MASK))
+		if (!((sp ^ vaddr) & ~PAGE_MASK))
 			return true;
 	}
 
@@ -170,13 +169,14 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 	u64 *at = &map[PAGE_PFN(*off)];
 	unsigned long pfn, nr_to_scan;
 	unsigned long pages[3] = {};
+	int ret = 0;
 
 	nr_to_scan = (vma_area_len(vma) - *off) / PAGE_SIZE;
 
 	for (pfn = 0; pfn < nr_to_scan; pfn++) {
 		unsigned long vaddr;
 		unsigned int ppb_flags = 0;
-		int ret;
+		int st;
 
 		if (!should_dump_page(vma->e, at[pfn]))
 			continue;
@@ -195,19 +195,22 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 
 		if (has_parent && page_in_parent(at[pfn] & PME_SOFT_DIRTY)) {
 			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
-			pages[0]++;
+			st = 0;
 		} else {
 			ret = page_pipe_add_page(pp, vaddr, ppb_flags);
 			if (ppb_flags & PPB_LAZY && opts.lazy_pages)
-				pages[1]++;
+				st = 1;
 			else
-				pages[2]++;
+				st = 2;
 		}
 
 		if (ret) {
-			*off += pfn * PAGE_SIZE;
-			return ret;
+			/* Do not do pfn++, just bail out */
+			pr_debug("Pagemap full\n");
+			break;
 		}
+
+		pages[st]++;
 	}
 
 	*off += pfn * PAGE_SIZE;
@@ -219,7 +222,7 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 
 	pr_info("Pagemap generated: %lu pages (%lu lazy) %lu holes\n",
 		pages[2] + pages[1], pages[1], pages[0]);
-	return 0;
+	return ret;
 }
 
 static struct parasite_dump_pages_args *prep_dump_pages_args(struct parasite_ctl *ctl,
@@ -594,7 +597,6 @@ int prepare_mm_pid(struct pstree_item *i)
 		if (!vma)
 			break;
 
-		ret = 0;
 		ri->vmas.nr++;
 		if (!img)
 			vma->e = ri->mm->vmas[vn++];
@@ -603,6 +605,7 @@ int prepare_mm_pid(struct pstree_item *i)
 			if (ret <= 0) {
 				xfree(vma);
 				close_image(img);
+				img = NULL;
 				break;
 			}
 		}
@@ -629,6 +632,8 @@ int prepare_mm_pid(struct pstree_item *i)
 			break;
 	}
 
+	if (img)
+		close_image(img);
 	return ret;
 }
 

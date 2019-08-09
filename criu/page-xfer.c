@@ -21,6 +21,8 @@
 #include "parasite-syscall.h"
 #include "rst_info.h"
 #include "stats.h"
+#include "img-remote.h"
+#include "tls.h"
 
 static int page_server_sk = -1;
 
@@ -128,13 +130,22 @@ static inline u32 decode_ps_flags(u32 cmd)
 	return cmd >> PS_CMD_BITS;
 }
 
+static inline int __send(int sk, const void *buf, size_t sz, int fl)
+{
+	return opts.tls ? tls_send(buf, sz, fl) : send(sk, buf, sz, fl);
+}
+
+static inline int __recv(int sk, void *buf, size_t sz, int fl)
+{
+	return opts.tls ? tls_recv(buf, sz, fl) : recv(sk, buf, sz, fl);
+}
+
 static inline int send_psi_flags(int sk, struct page_server_iov *pi, int flags)
 {
-	if (send(sk, pi, sizeof(*pi), flags) != sizeof(*pi)) {
+	if (__send(sk, pi, sizeof(*pi), flags) != sizeof(*pi)) {
 		pr_perror("Can't send PSI %d to server", pi->cmd);
 		return -1;
 	}
-
 	return 0;
 }
 
@@ -149,17 +160,28 @@ static int write_pages_to_server(struct page_xfer *xfer,
 {
 	ssize_t ret, left = len;
 
-	pr_debug("Splicing %lu bytes / %lu pages into socket\n", len, len / PAGE_SIZE);
+	if (opts.tls) {
+		pr_debug("Sending %lu bytes / %lu pages\n",
+			len, len / PAGE_SIZE);
 
-	while (left > 0) {
-		ret = splice(p, NULL, xfer->sk, NULL, left, SPLICE_F_MOVE);
-		if (ret < 0) {
-			pr_perror("Can't write pages to socket");
+		if (tls_send_data_from_fd(p, len))
 			return -1;
-		}
+	} else {
+		pr_debug("Splicing %lu bytes / %lu pages into socket\n",
+			len, len / PAGE_SIZE);
 
-		pr_debug("\tSpliced: %lu bytes sent\n", (unsigned long)ret);
-		left -= ret;
+		while (left > 0) {
+			ret = splice(p, NULL, xfer->sk, NULL, left,
+					SPLICE_F_MOVE);
+			if (ret < 0) {
+				pr_perror("Can't write pages to socket");
+				return -1;
+			}
+
+			pr_debug("\tSpliced: %lu bytes sent\n",
+				(unsigned long)ret);
+			left -= ret;
+		}
 	}
 
 	return 0;
@@ -205,7 +227,7 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
 	/* Push the command NOW */
 	tcp_nodelay(xfer->sk, true);
 
-	if (read(xfer->sk, &has_parent, 1) != 1) {
+	if (__recv(xfer->sk, &has_parent, 1, 0) != 1) {
 		pr_perror("The page server doesn't answer");
 		return -1;
 	}
@@ -357,13 +379,29 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 		int pfd;
 		int pr_flags = (fd_type == CR_FD_PAGEMAP) ? PR_TASK : PR_SHMEM;
 
-		pfd = openat(get_service_fd(IMG_FD_OFF), CR_PARENT_LINK, O_RDONLY);
-		if (pfd < 0 && errno == ENOENT)
-			goto out;
+
+		if (opts.remote) {
+			/* Note: we are replacing a real directory FD for a snapshot_id
+			 * index. Since we need the parent of the current snapshot_id,
+			 * we want the current snapshot_id index minus one. It is
+			 * possible that dfd is already a snapshot_id index. We test it
+			 * by comparing it to the service FD. When opening an image (see
+			 * do_open_image) we convert the snapshot_id index into a real
+			 * snapshot_id.
+			 */
+			pfd = get_curr_snapshot_id_idx() - 1;
+			if (pfd < 0)
+				goto out;
+		} else {
+			pfd = openat(get_service_fd(IMG_FD_OFF), CR_PARENT_LINK, O_RDONLY);
+			if (pfd < 0 && errno == ENOENT)
+				goto out;
+		}
 
 		xfer->parent = xmalloc(sizeof(*xfer->parent));
 		if (!xfer->parent) {
-			close(pfd);
+			if (!opts.remote)
+				close(pfd);
 			return -1;
 		}
 
@@ -372,10 +410,12 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 			pr_perror("No parent image found, though parent directory is set");
 			xfree(xfer->parent);
 			xfer->parent = NULL;
-			close(pfd);
+			if (!opts.remote)
+				close(pfd);
 			goto out;
 		}
-		close(pfd);
+		if (!opts.remote)
+			close(pfd);
 	}
 
 out:
@@ -507,6 +547,9 @@ int check_parent_local_xfer(int fd_type, unsigned long img_id)
 	struct stat st;
 	int ret, pfd;
 
+	if (opts.remote)
+		return get_curr_parent_snapshot_id_idx() == -1 ? 0 : 1;
+
 	pfd = openat(get_service_fd(IMG_FD_OFF), CR_PARENT_LINK, O_RDONLY);
 	if (pfd < 0 && errno == ENOENT)
 		return 0;
@@ -539,7 +582,7 @@ static int page_server_check_parent(int sk, struct page_server_iov *pi)
 	if (ret < 0)
 		return -1;
 
-	if (write(sk, &ret, sizeof(ret)) != sizeof(ret)) {
+	if (__send(sk, &ret, sizeof(ret), 0) != sizeof(ret)) {
 		pr_perror("Unable to send response");
 		return -1;
 	}
@@ -560,7 +603,7 @@ static int check_parent_server_xfer(int fd_type, unsigned long img_id)
 
 	tcp_nodelay(page_server_sk, true);
 
-	if (read(page_server_sk, &has_parent, sizeof(int)) != sizeof(int)) {
+	if (__recv(page_server_sk, &has_parent, sizeof(int), 0) != sizeof(int)) {
 		pr_perror("The page server doesn't answer");
 		return -1;
 	}
@@ -624,8 +667,7 @@ static int page_server_open(int sk, struct page_server_iov *pi)
 
 	if (sk >= 0) {
 		char has_parent = !!cxfer.loc_xfer.parent;
-
-		if (write(sk, &has_parent, 1) != 1) {
+		if (__send(sk, &has_parent, 1, 0) != 1) {
 			pr_perror("Unable to send response");
 			close_page_xfer(&cxfer.loc_xfer);
 			return -1;
@@ -684,14 +726,23 @@ static int page_server_add(int sk, struct page_server_iov *pi, u32 flags)
 			return -1;
 		}
 
-		chunk = splice(sk, NULL, cxfer.p[1], NULL, chunk, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
-		if (chunk < 0) {
-			pr_perror("Can't read from socket");
-			return -1;
-		}
-		if (chunk == 0) {
-			pr_err("A socket was closed unexpectedly\n");
-			return -1;
+		if (opts.tls) {
+			if(tls_recv_data_to_fd(cxfer.p[1], chunk)) {
+				pr_err("Can't read from socket\n");
+				return -1;
+			}
+		} else {
+			chunk = splice(sk, NULL, cxfer.p[1], NULL, chunk,
+					SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+
+			if (chunk < 0) {
+				pr_perror("Can't read from socket");
+				return -1;
+			}
+			if (chunk == 0) {
+				pr_err("A socket was closed unexpectedly\n");
+				return -1;
+			}
 		}
 
 		if (lxfer->write_pages(lxfer, cxfer.p[0], chunk))
@@ -733,9 +784,16 @@ static int page_server_get_pages(int sk, struct page_server_iov *pi)
 		return -1;
 
 	len = pi->nr_pages * PAGE_SIZE;
-	ret = splice(pipe_read_dest.p[0], NULL, sk, NULL, len, SPLICE_F_MOVE);
-	if (ret != len)
-		return -1;
+
+	if (opts.tls) {
+		if (tls_send_data_from_fd(pipe_read_dest.p[0], len))
+			return -1;
+	} else {
+		ret = splice(pipe_read_dest.p[0], NULL, sk, NULL, len,
+			SPLICE_F_MOVE);
+		if (ret != len)
+			return -1;
+	}
 
 	tcp_nodelay(sk, true);
 
@@ -773,7 +831,7 @@ static int page_server_serve(int sk)
 		struct page_server_iov pi;
 		u32 cmd;
 
-		ret = recv(sk, &pi, sizeof(pi), MSG_WAITALL);
+		ret = __recv(sk, &pi, sizeof(pi), MSG_WAITALL);
 		if (!ret)
 			break;
 
@@ -823,7 +881,7 @@ static int page_server_serve(int sk)
 			 * An answer must be sent back to inform another side,
 			 * that all data were received
 			 */
-			if (write(sk, &status, sizeof(status)) != sizeof(status)) {
+			if (__send(sk, &status, sizeof(status), 0) != sizeof(status)) {
 				pr_perror("Can't send the final package");
 				ret = -1;
 			}
@@ -856,14 +914,15 @@ static int page_server_serve(int sk)
 		 * Wait when a remote side closes the connection
 		 * to avoid TIME_WAIT bucket
 		 */
-
 		if (read(sk, &c, sizeof(c)) != 0) {
 			pr_perror("Unexpected data");
 			ret = -1;
 		}
 	}
 
+	tls_terminate_session();
 	page_server_close();
+
 	pr_info("Session over\n");
 
 	close(sk);
@@ -985,13 +1044,12 @@ int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd)
 			return -1;
 
 	if (opts.ps_socket != -1) {
-		ret = 0;
 		ask = opts.ps_socket;
 		pr_info("Re-using ps socket %d\n", ask);
 		goto no_server;
 	}
 
-	sk = setup_tcp_server("page", opts.addr, &opts.port);
+	sk = setup_tcp_server("page");
 	if (sk == -1)
 		return -1;
 no_server:
@@ -1011,6 +1069,11 @@ no_server:
 	ret = run_tcp_server(daemon_mode, &ask, cfd, sk);
 	if (ret != 0)
 		return ret > 0 ? 0 : -1;
+
+	if (tls_x509_init(ask, true)) {
+		close(sk);
+		return -1;
+	}
 
 	if (ask >= 0)
 		ret = page_server_serve(ask);
@@ -1032,9 +1095,14 @@ static int connect_to_page_server(void)
 		goto out;
 	}
 
-	page_server_sk = setup_tcp_client(opts.addr);
+	page_server_sk = setup_tcp_client();
 	if (page_server_sk == -1)
 		return -1;
+
+	if (tls_x509_init(page_server_sk, false)) {
+		close(page_server_sk);
+		return -1;
+	}
 out:
 	/*
 	 * CORK the socket at the very beginning. As per ANK
@@ -1062,8 +1130,7 @@ int disconnect_from_page_server(void)
 	if (page_server_sk == -1)
 		return 0;
 
-	pr_info("Disconnect from the page server %s:%u\n",
-			opts.addr, opts.port);
+	pr_info("Disconnect from the page server\n");
 
 	if (opts.ps_socket != -1)
 		/*
@@ -1078,14 +1145,16 @@ int disconnect_from_page_server(void)
 	if (send_psi(page_server_sk, &pi))
 		goto out;
 
-	if (read(page_server_sk, &status, sizeof(status)) != sizeof(status)) {
+	if (__recv(page_server_sk, &status, sizeof(status), 0) != sizeof(status)) {
 		pr_perror("The page server doesn't answer");
 		goto out;
 	}
 
 	ret = 0;
 out:
+	tls_terminate_session();
 	close_safe(&page_server_sk);
+
 	return ret ? : status;
 }
 
@@ -1162,10 +1231,14 @@ static int page_server_read(struct ps_async_read *ar, int flags)
 		need = ar->goal - ar->rb;
 	}
 
-	ret = recv(page_server_sk, buf, need, flags);
+	ret = __recv(page_server_sk, buf, need, flags);
 	if (ret < 0) {
-		pr_perror("Error reading async data from page server");
-		return -1;
+		if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR)) {
+			ret = 0;
+		} else {
+			pr_perror("Error reading data from page server");
+			return -1;
+		}
 	}
 
 	ar->rb += ret;

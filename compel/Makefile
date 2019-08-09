@@ -11,7 +11,6 @@ ccflags-y		+= -iquote compel/arch/$(ARCH)/src/lib/include
 ccflags-y		+= -iquote compel/include
 ccflags-y		+= -fno-strict-aliasing
 ccflags-y		+= -fPIC
-ccflags-y		+= $(CFLAGS_PIE)
 ldflags-y		+= -r
 
 #
@@ -24,10 +23,6 @@ host-lib-y		+= src/lib/log.o
 
 lib-y			+= arch/$(ARCH)/src/lib/cpu.o
 lib-y			+= arch/$(ARCH)/src/lib/infect.o
-lib-y			+= arch/$(ARCH)/src/lib/handle-elf.o
-host-lib-y		+= arch/$(ARCH)/src/lib/handle-elf.o
-lib-y			+= src/lib/handle-elf.o
-host-lib-y		+= src/lib/handle-elf.o
 lib-y			+= src/lib/infect-rpc.o
 lib-y			+= src/lib/infect-util.o
 lib-y			+= src/lib/infect.o
@@ -40,6 +35,8 @@ HOSTCFLAGS		+= -DNO_RELOCS
 endif
 
 obj-y			+= src/main.o
+obj-y			+= arch/$(ARCH)/src/lib/handle-elf.o
+obj-y			+= src/lib/handle-elf.o
 
 host-ccflags-y		+= $(ccflags-y)
 
@@ -64,10 +61,10 @@ install: compel/compel compel/$(LIBCOMPEL_SO) compel/$(LIBCOMPEL_A)
 	$(Q) install -m 0644 compel/$(LIBCOMPEL_A) $(DESTDIR)$(LIBDIR)
 	$(E) "  INSTALL " compel uapi
 	$(Q) mkdir -p $(DESTDIR)$(INCLUDEDIR)/compel/asm
-	$(Q) cp -fr compel/include/uapi/*.h $(DESTDIR)$(INCLUDEDIR)/compel/
-	$(Q) cp -fr compel/include/uapi/asm/*.h $(DESTDIR)$(INCLUDEDIR)/compel/asm/
+	$(Q) cp compel/include/uapi/*.h $(DESTDIR)$(INCLUDEDIR)/compel/
+	$(Q) cp compel/include/uapi/asm/*.h $(DESTDIR)$(INCLUDEDIR)/compel/asm/
 	$(Q) mkdir -p $(DESTDIR)$(INCLUDEDIR)/compel/common/asm
-	$(Q) cp -fr include/common/compiler.h $(DESTDIR)$(INCLUDEDIR)/compel/common/
+	$(Q) cp include/common/compiler.h $(DESTDIR)$(INCLUDEDIR)/compel/common/
 .PHONY: install
 
 uninstall:

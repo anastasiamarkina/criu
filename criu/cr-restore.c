@@ -4,16 +4,13 @@
 #include <limits.h>
 #include <unistd.h>
 #include <errno.h>
-#include <dirent.h>
 #include <string.h>
 
 #include <fcntl.h>
-#include <grp.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
-#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <sys/file.h>
 #include <sys/shm.h>
@@ -21,7 +18,6 @@
 #include <sys/prctl.h>
 #include <sched.h>
 
-#include <sys/sendfile.h>
 
 #include "types.h"
 #include <compel/ptrace.h>
@@ -31,6 +27,7 @@
 #include "cr_options.h"
 #include "servicefd.h"
 #include "image.h"
+#include "img-remote.h"
 #include "util.h"
 #include "util-pie.h"
 #include "criu-log.h"
@@ -39,7 +36,6 @@
 #include "sk-packet.h"
 #include "common/lock.h"
 #include "files.h"
-#include "files-reg.h"
 #include "pipes.h"
 #include "fifo.h"
 #include "sk-inet.h"
@@ -68,7 +64,6 @@
 #include "plugin.h"
 #include "cgroup.h"
 #include "timerfd.h"
-#include "file-lock.h"
 #include "action-scripts.h"
 #include "shmem.h"
 #include <compel/compel.h>
@@ -143,7 +138,6 @@ static inline int stage_participants(int next_stage)
 	case CR_STATE_RESTORE:
 		return task_entries->nr_threads + task_entries->nr_helpers;
 	case CR_STATE_RESTORE_SIGCHLD:
-		return task_entries->nr_threads;
 	case CR_STATE_RESTORE_CREDS:
 		return task_entries->nr_threads;
 	}
@@ -397,10 +391,10 @@ static int populate_root_fd_off(void)
 	struct ns_id *mntns = NULL;
 	int ret;
 
-        if (root_ns_mask & CLONE_NEWNS) {
-                mntns = lookup_ns_by_id(root_item->ids->mnt_ns_id, &mnt_ns_desc);
-                BUG_ON(!mntns);
-        }
+	if (root_ns_mask & CLONE_NEWNS) {
+		mntns = lookup_ns_by_id(root_item->ids->mnt_ns_id, &mnt_ns_desc);
+		BUG_ON(!mntns);
+	}
 
 	ret = mntns_get_root_fd(mntns);
 	if (ret < 0)
@@ -845,7 +839,7 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 
 	args_len = round_up(sizeof(*ta) + sizeof(struct thread_restore_args) *
 			current->nr_threads, page_size());
-	ta = mmap(NULL, args_len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, 0, 0);
+	ta = mmap(NULL, args_len, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
 	if (!ta)
 		return -1;
 
@@ -1494,7 +1488,7 @@ static void restore_sid(void)
 			exit(1);
 		}
 	} else {
-		sid = getsid(getpid());
+		sid = getsid(0);
 		if (sid != current->sid) {
 			/* Skip the root task if it's not init */
 			if (current == root_item && vpid(root_item) != INIT_PID)
@@ -1599,7 +1593,7 @@ static int create_children_and_session(void)
 		if (!restore_before_setsid(child))
 			continue;
 
-		BUG_ON(child->born_sid != -1 && getsid(getpid()) != child->born_sid);
+		BUG_ON(child->born_sid != -1 && getsid(0) != child->born_sid);
 
 		ret = fork_with_pid(child);
 		if (ret < 0)
@@ -2134,7 +2128,7 @@ static int restore_root_task(struct pstree_item *init)
 			goto out_kill;
 	}
 
-	if (opts.empty_ns & CLONE_NEWNET) {
+	if (root_ns_mask & opts.empty_ns & CLONE_NEWNET) {
 		/*
 		 * Local TCP connections were locked by network_lock_internal()
 		 * on dump and normally should have been C/R-ed by respectively
@@ -2333,41 +2327,12 @@ int prepare_dummy_task_state(struct pstree_item *pi)
 	return 0;
 }
 
-static void rlimit_unlimit_nofile_self(void)
-{
-	struct rlimit new;
-
-	new.rlim_cur = kdat.sysctl_nr_open;
-	new.rlim_max = kdat.sysctl_nr_open;
-
-	if (prlimit(getpid(), RLIMIT_NOFILE, &new, NULL)) {
-		pr_perror("rlimir: Can't setup RLIMIT_NOFILE for self");
-		return;
-	} else
-		pr_debug("rlimit: RLIMIT_NOFILE unlimited for self\n");
-	service_fd_rlim_cur = kdat.sysctl_nr_open;
-}
-
 int cr_restore_tasks(void)
 {
 	int ret = -1;
 
-	/*
-	 * Service fd engine implies that file descriptors
-	 * used won't be borrowed by the rest of the code
-	 * and default 1024 limit is not enough for high
-	 * loaded test/containers. Thus use kdat engine
-	 * to fetch current system level limit for numbers
-	 * of files allowed to open up and lift up own
-	 * limits.
-	 *
-	 * Note we have to do it before the service fd
-	 * get inited and we dont exit with errors here
-	 * because in worst scenario where clash of fd
-	 * happen we simply exit with explicit error
-	 * during real action stage.
-	 */
-	rlimit_unlimit_nofile_self();
+	if (init_service_fd())
+		return 1;
 
 	if (cr_plugin_init(CR_PLUGIN_STAGE__RESTORE))
 		return -1;
@@ -2416,6 +2381,11 @@ int cr_restore_tasks(void)
 		goto err;
 
 	ret = restore_root_task(root_item);
+
+	if (opts.remote && (finish_remote_restore() < 0)) {
+		pr_err("Finish remote restore failed.\n");
+		goto err;
+	}
 err:
 	cr_plugin_fini(CR_PLUGIN_STAGE__RESTORE, ret);
 	return ret;
@@ -2763,7 +2733,7 @@ static int prepare_restorer_blob(void)
 	restorer_len = pie_size(restorer);
 	restorer = mmap(NULL, restorer_len,
 			PROT_READ | PROT_WRITE | PROT_EXEC,
-			MAP_PRIVATE | MAP_ANON, 0, 0);
+			MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
 	if (restorer == MAP_FAILED) {
 		pr_perror("Can't map restorer code");
 		return -1;
@@ -3030,6 +3000,8 @@ static void rst_reloc_creds(struct thread_restore_args *thread_args,
 
 	if (args->lsm_profile)
 		args->lsm_profile = rst_mem_remap_ptr(args->mem_lsm_profile_pos, RM_PRIVATE);
+	if (args->lsm_sockcreate)
+		args->lsm_sockcreate = rst_mem_remap_ptr(args->mem_lsm_sockcreate_pos, RM_PRIVATE);
 	if (args->groups)
 		args->groups = rst_mem_remap_ptr(args->mem_groups_pos, RM_PRIVATE);
 
@@ -3093,6 +3065,40 @@ rst_prep_creds_args(CredsEntry *ce, unsigned long *prev_pos)
 	} else {
 		args->lsm_profile = NULL;
 		args->mem_lsm_profile_pos = 0;
+	}
+
+	if (ce->lsm_sockcreate) {
+		char *rendered = NULL;
+		char *profile;
+
+		profile = ce->lsm_sockcreate;
+
+		if (validate_lsm(profile) < 0)
+			return ERR_PTR(-EINVAL);
+
+		if (profile && render_lsm_profile(profile, &rendered)) {
+			return ERR_PTR(-EINVAL);
+		}
+		if (rendered) {
+			size_t lsm_sockcreate_len;
+			char *lsm_sockcreate;
+
+			args->mem_lsm_sockcreate_pos = rst_mem_align_cpos(RM_PRIVATE);
+			lsm_sockcreate_len = strlen(rendered);
+			lsm_sockcreate = rst_mem_alloc(lsm_sockcreate_len + 1, RM_PRIVATE);
+			if (!lsm_sockcreate) {
+				xfree(rendered);
+				return ERR_PTR(-ENOMEM);
+			}
+
+			args = rst_mem_remap_ptr(this_pos, RM_PRIVATE);
+			args->lsm_sockcreate = lsm_sockcreate;
+			strncpy(args->lsm_sockcreate, rendered, lsm_sockcreate_len);
+			xfree(rendered);
+		}
+	} else {
+		args->lsm_sockcreate = NULL;
+		args->mem_lsm_sockcreate_pos = 0;
 	}
 
 	/*
@@ -3225,10 +3231,8 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	struct thread_restore_args *thread_args;
 	struct restore_mem_zone *mz;
 
-#ifdef CONFIG_VDSO
 	struct vdso_maps vdso_maps_rt;
 	unsigned long vdso_rt_size = 0;
-#endif
 
 	struct vm_area_list self_vmas;
 	struct vm_area_list *vmas = &rsti(current)->vmas;
@@ -3257,6 +3261,9 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 		/* Wait when all tasks restored all files */
 		if (restore_wait_other_tasks())
 			goto err_nv;
+		if (root_ns_mask & CLONE_NEWNS &&
+		    remount_readonly_mounts())
+			goto err_nv;
 	}
 
 	/*
@@ -3276,7 +3283,6 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	pr_info("%d threads require %ldK of memory\n",
 			current->nr_threads, KBYTES(task_args->bootstrap_len));
 
-#ifdef CONFIG_VDSO
 	if (core_is_compat(core))
 		vdso_maps_rt = vdso_maps_compat;
 	else
@@ -3288,7 +3294,6 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	if (vdso_rt_size && vdso_maps_rt.sym.vvar_size)
 		vdso_rt_size += ALIGN(vdso_maps_rt.sym.vvar_size, PAGE_SIZE);
 	task_args->bootstrap_len += vdso_rt_size;
-#endif
 
 	/*
 	 * Restorer is a blob (code + args) that will get mapped in some
@@ -3329,7 +3334,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 
 	/* VMA we need for stacks and sigframes for threads */
 	if (mmap(mem, memzone_size, PROT_READ | PROT_WRITE,
-			MAP_PRIVATE | MAP_ANON | MAP_FIXED, 0, 0) != mem) {
+			MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, 0, 0) != mem) {
 		pr_err("Can't mmap section for restore code\n");
 		goto err;
 	}
@@ -3503,7 +3508,6 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 
 	}
 
-#ifdef CONFIG_VDSO
 	/*
 	 * Restorer needs own copy of vdso parameters. Runtime
 	 * vdso must be kept non intersecting with anything else,
@@ -3515,7 +3519,6 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	task_args->vdso_maps_rt = vdso_maps_rt;
 	task_args->vdso_rt_size = vdso_rt_size;
 	task_args->can_map_vdso = kdat.can_map_vdso;
-#endif
 
 	new_sp = restorer_stack(task_args->t->mz);
 
@@ -3530,6 +3533,13 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	task_args->thread_args		= thread_args;
 
 	task_args->auto_dedup		= opts.auto_dedup;
+
+	/*
+	 * In the restorer we need to know if it is SELinux or not. For SELinux
+	 * we must change the process context before creating threads. For
+	 * Apparmor we can change each thread after they have been created.
+	 */
+	task_args->lsm_type		= kdat.lsm;
 
 	/*
 	 * Make root and cwd restore _that_ late not to break any

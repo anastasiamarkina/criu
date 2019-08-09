@@ -437,8 +437,8 @@ static int dump_one_unix_fd(int lfd, uint32_t id, const struct fd_parms *p)
 		 */
 		if (peer->peer_ino != ue->ino) {
 			if (!peer->name) {
-				pr_err("Unix socket %d with unreachable peer %d (%d/%s)\n",
-				       ue->ino, ue->peer, peer->peer_ino, peer->name);
+				pr_err("Unix socket %d with unreachable peer %d (%d)\n",
+				       ue->ino, ue->peer, peer->peer_ino);
 				goto err;
 			}
 		}
@@ -1208,14 +1208,14 @@ static int prep_unix_sk_cwd(struct unix_sk_info *ui, int *prev_cwd_fd,
 	if (prev_root_fd && (root_ns_mask & CLONE_NEWNS)) {
 		if (ui->ue->mnt_id >= 0) {
 			ns = lookup_nsid_by_mnt_id(ui->ue->mnt_id);
-			if (ns == NULL)
-				goto err;
 		} else {
 			if (root == NULL)
 				root = lookup_ns_by_id(root_item->ids->mnt_ns_id,
 									&mnt_ns_desc);
 			ns = root;
 		}
+		if (ns == NULL)
+			goto err;
 		*prev_root_fd = open("/", O_RDONLY);
 		if (*prev_root_fd < 0) {
 			pr_perror("Can't open current root");
@@ -1542,7 +1542,6 @@ static int bind_on_deleted(int sk, struct unix_sk_info *ui)
 		     pos = strrchr(path, '/')) {
 			*pos = '\0';
 			if (rmdir(path)) {
-				ret = - errno;
 				pr_perror("ghost: Can't remove directory %s on id %#x ino %d",
 					  path, ui->ue->id, ui->ue->ino);
 				return -1;
@@ -1889,13 +1888,16 @@ static int open_unixsk_standalone(struct unix_sk_info *ui, int *new_fd)
 		}
 	}
 
-	if (bind_unix_sk(sk, ui))
+	if (bind_unix_sk(sk, ui)) {
+		close(sk);
 		return -1;
+	}
 
 	if (ui->ue->state == TCP_LISTEN) {
 		pr_info("\tPutting %d into listen state\n", ui->ue->ino);
 		if (listen(sk, ui->ue->backlog) < 0) {
 			pr_perror("Can't make usk listen");
+			close(sk);
 			return -1;
 		}
 		ui->listen = 1;

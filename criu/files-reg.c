@@ -6,12 +6,12 @@
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/vfs.h>
 #include <sys/prctl.h>
 #include <ctype.h>
 #include <sys/sendfile.h>
 #include <sched.h>
 #include <sys/capability.h>
+#include <sys/mount.h>
 
 #ifndef SEEK_DATA
 #define SEEK_DATA	3
@@ -155,11 +155,32 @@ static int copy_chunk_from_file(int fd, int img, off_t off, size_t len)
 	char *buf = NULL;
 	int ret;
 
-	while (len > 0) {
-		ret = sendfile(img, fd, &off, len);
-		if (ret <= 0) {
-			pr_perror("Can't send ghost to image");
+	if (opts.remote) {
+		buf = xmalloc(BUFSIZE);
+		if (!buf)
 			return -1;
+	}
+
+	while (len > 0) {
+		if (opts.remote) {
+			ret = pread(fd, buf, min_t(size_t, BUFSIZE, len), off);
+			if (ret <= 0) {
+				pr_perror("Can't read from ghost file");
+				xfree(buf);
+				return -1;
+			}
+			if (write(img, buf, ret) != ret) {
+				pr_perror("Can't write to image");
+				xfree(buf);
+				return -1;
+			}
+			off += ret;
+		} else {
+			ret = sendfile(img, fd, &off, len);
+			if (ret <= 0) {
+				pr_perror("Can't send ghost to image");
+				return -1;
+			}
 		}
 
 		len -= ret;
@@ -214,15 +235,35 @@ static int copy_chunk_to_file(int img, int fd, off_t off, size_t len)
 	char *buf = NULL;
 	int ret;
 
+	if (opts.remote) {
+		buf = xmalloc(BUFSIZE);
+		if (!buf)
+			return -1;
+	}
+
 	while (len > 0) {
-		if (lseek(fd, off, SEEK_SET) < 0) {
-			pr_perror("Can't seek file");
-			return -1;
-		}
-		ret = sendfile(fd, img, NULL, len);
-		if (ret < 0) {
-			pr_perror("Can't send data");
-			return -1;
+		if (opts.remote) {
+			ret = read(img, buf, min_t(size_t, BUFSIZE, len));
+			if (ret <= 0) {
+				pr_perror("Can't read from image");
+				xfree(buf);
+				return -1;
+			}
+			if (pwrite(fd, buf, ret, off) != ret) {
+				pr_perror("Can't write to file");
+				xfree(buf);
+				return -1;
+			}
+		} else {
+			if (lseek(fd, off, SEEK_SET) < 0) {
+				pr_perror("Can't seek file");
+				return -1;
+			}
+			ret = sendfile(fd, img, NULL, len);
+			if (ret < 0) {
+				pr_perror("Can't send data");
+				return -1;
+			}
 		}
 
 		off += ret;
@@ -313,6 +354,7 @@ err:
 
 static int create_ghost(struct ghost_file *gf, GhostFileEntry *gfe, struct cr_img *img)
 {
+	struct mount_info *mi;
 	char path[PATH_MAX];
 	int ret, root_len;
 	char *msg;
@@ -331,6 +373,11 @@ static int create_ghost(struct ghost_file *gf, GhostFileEntry *gfe, struct cr_im
 
 	snprintf(path + root_len, sizeof(path) - root_len, "%s", gf->remap.rpath);
 	ret = -1;
+
+	mi = lookup_mnt_id(gf->remap.rmnt_id);
+	/* We get here while in service mntns */
+	if (mi && try_remount_writable(mi, false))
+		goto err;
 again:
 	if (S_ISFIFO(gfe->mode)) {
 		if ((ret = mknod(path, gfe->mode, 0)) < 0)
@@ -655,9 +702,10 @@ int prepare_remaps(void)
 
 static int clean_one_remap(struct remap_info *ri)
 {
-	char path[PATH_MAX];
-	int mnt_id, ret, rmntns_root;
 	struct file_remap *remap = ri->rfi->remap;
+	int mnt_id, ret, rmntns_root;
+	struct mount_info *mi;
+	char path[PATH_MAX];
 
 	if (remap->rpath[0] == 0)
 		return 0;
@@ -677,12 +725,19 @@ static int clean_one_remap(struct remap_info *ri)
 		return -1;
 	}
 
+	mi = lookup_mnt_id(mnt_id);
+	/* We get here while in service mntns */
+	if (mi && try_remount_writable(mi, false)) {
+		close(rmntns_root);
+		return -1;
+	}
+
 	pr_info("Unlink remap %s\n", remap->rpath);
 
 	ret = unlinkat(rmntns_root, remap->rpath, remap->is_dir ? AT_REMOVEDIR : 0);
 	if (ret < 0) {
 		close(rmntns_root);
-		pr_perror("Couldn't unlink remap %d %s", rmntns_root, remap->rpath);
+		pr_perror("Couldn't unlink remap %s %s", path, remap->rpath);
 		return -1;
 	}
 	close(rmntns_root);
@@ -1123,6 +1178,9 @@ static int check_path_remap(struct fd_link *link, const struct fd_parms *parms,
 		 */
 		if (pid != 0) {
 			bool is_dead = strip_deleted(link);
+			mntns_root = mntns_get_root_fd(nsid);
+			if (mntns_root < 0)
+				return -1;
 
 			/* /proc/<pid> will be "/proc/1 (deleted)" when it is
 			 * dead, but a path like /proc/1/mountinfo won't have
@@ -1134,7 +1192,7 @@ static int check_path_remap(struct fd_link *link, const struct fd_parms *parms,
 			 */
 			if (!is_dead) {
 				*end = 0;
-				is_dead = access(rpath, F_OK);
+				is_dead = faccessat(mntns_root, rpath, F_OK, 0);
 				*end = '/';
 			}
 
@@ -1247,7 +1305,7 @@ static bool should_check_size(int flags)
 int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 {
 	struct fd_link _link, *link;
-	struct ns_id *nsid;
+	struct mount_info *mi;
 	struct cr_img *rimg;
 	char ext_id[64];
 	FileEntry fe = FILE_ENTRY__INIT;
@@ -1271,10 +1329,15 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 		goto ext;
 	}
 
-	nsid = lookup_nsid_by_mnt_id(p->mnt_id);
-	if (nsid == NULL) {
+	mi = lookup_mnt_id(p->mnt_id);
+	if (mi == NULL) {
 		pr_err("Can't lookup mount=%d for fd=%d path=%s\n",
 			p->mnt_id, p->fd, link->name + 1);
+		return -1;
+	}
+
+	if (mnt_is_overmounted(mi)) {
+		pr_err("Open files on overmounted mounts are not supported yet\n");
 		return -1;
 	}
 
@@ -1294,7 +1357,7 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 		return -1;
 	}
 
-	if (check_path_remap(link, p, lfd, id, nsid))
+	if (check_path_remap(link, p, lfd, id, mi->nsid))
 		return -1;
 	rfe.name	= &link->name[1];
 ext:
@@ -1531,6 +1594,9 @@ static int rfi_remap(struct reg_file_info *rfi, int *level)
 	}
 
 	mi = lookup_mnt_id(rfi->rfe->mnt_id);
+	if (mi == NULL)
+		return -1;
+
 	if (rfi->rfe->mnt_id == rfi->remap->rmnt_id) {
 		/* Both links on the same mount point */
 		tmi = mi;
@@ -1540,6 +1606,8 @@ static int rfi_remap(struct reg_file_info *rfi, int *level)
 	}
 
 	rmi = lookup_mnt_id(rfi->remap->rmnt_id);
+	if (rmi == NULL)
+		return -1;
 
 	/*
 	 * Find the common bind-mount. We know that one mount point was
@@ -1557,9 +1625,13 @@ static int rfi_remap(struct reg_file_info *rfi, int *level)
 	convert_path_from_another_mp(rfi->remap->rpath, rpath, sizeof(_rpath), rmi, tmi);
 
 out:
-	pr_debug("%d: Link %s -> %s\n", tmi->mnt_id, rpath, path);
 	mntns_root = mntns_get_root_fd(tmi->nsid);
 
+	/* We get here while in task's mntns */
+	if (try_remount_writable(tmi, true))
+		return -1;
+
+	pr_debug("%d: Link %s -> %s\n", tmi->mnt_id, rpath, path);
 out_root:
 	*level = make_parent_dirs_if_need(mntns_root, path);
 	if (*level < 0)
@@ -1594,7 +1666,11 @@ int open_path(struct file_desc *d,
 		tmp = inherit_fd_lookup_id(rfi->rfe->name);
 		if (tmp >= 0) {
 			inh_fd = tmp;
-			mntns_root = open_pid_proc(PROC_SELF);
+			/* 
+			 * PROC_SELF isn't used, because only service
+			 * descriptors can be used here.
+			 */
+			mntns_root = open_pid_proc(getpid());
 			snprintf(path, sizeof(path), "fd/%d", tmp);
 			orig_path = rfi->path;
 			rfi->path = path;
@@ -1620,8 +1696,8 @@ int open_path(struct file_desc *d,
 			static char tmp_path[PATH_MAX];
 
 			if (errno != EEXIST) {
-				pr_perror("Can't link %s -> %s", rfi->path,
-						rfi->remap->rpath);
+				pr_perror("Can't link %s -> %s",
+					  rfi->remap->rpath, rfi->path);
 				return -1;
 			}
 
@@ -1674,12 +1750,10 @@ ext:
 		}
 
 		if (rfi->rfe->has_mode && (st.st_mode != rfi->rfe->mode)) {
-			if (st.st_mode != rfi->rfe->mode) {
-				pr_err("File %s has bad mode 0%o (expect 0%o)\n",
-				       rfi->path, (int)st.st_mode,
-				       rfi->rfe->mode);
-				return -1;
-			}
+			pr_err("File %s has bad mode 0%o (expect 0%o)\n",
+			       rfi->path, (int)st.st_mode,
+			       rfi->rfe->mode);
+			return -1;
 		}
 
 		/*

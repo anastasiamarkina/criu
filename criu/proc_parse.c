@@ -502,7 +502,6 @@ err:
 	return -1;
 }
 
-#ifdef CONFIG_VDSO
 static inline int handle_vdso_vma(struct vma_area *vma)
 {
 	vma->e->status |= VMA_AREA_REGULAR;
@@ -518,19 +517,6 @@ static inline int handle_vvar_vma(struct vma_area *vma)
 		vma->e->status |= VMA_AREA_VVAR;
 	return 0;
 }
-#else
-static inline int handle_vdso_vma(struct vma_area *vma)
-{
-	pr_warn_once("Found vDSO area without support\n");
-	return -1;
-}
-
-static inline int handle_vvar_vma(struct vma_area *vma)
-{
-	pr_warn_once("Found VVAR area without support\n");
-	return -1;
-}
-#endif
 
 static int handle_vma(pid_t pid, struct vma_area *vma_area,
 			const char *file_path, DIR *map_files_dir,
@@ -2277,6 +2263,7 @@ int parse_threads(int pid, struct pid **_t, int *_n)
 			tmp = xrealloc(t, nr * sizeof(struct pid));
 			if (!tmp) {
 				xfree(t);
+				closedir(dir);
 				return -1;
 			}
 			t = tmp;

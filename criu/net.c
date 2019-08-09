@@ -17,6 +17,10 @@
 #include <libnl3/netlink/msg.h>
 #include <libnl3/netlink/netlink.h>
 
+#ifdef CONFIG_HAS_SELINUX
+#include <selinux/selinux.h>
+#endif
+
 #include "../soccr/soccr.h"
 
 #include "imgset.h"
@@ -40,6 +44,7 @@
 
 #include "protobuf.h"
 #include "images/netdev.pb-c.h"
+#include "images/inventory.pb-c.h"
 
 #ifndef IFLA_LINK_NETNSID
 #define IFLA_LINK_NETNSID	37
@@ -339,7 +344,7 @@ static int ipv6_conf_op(char *tgt, SysctlEntry **conf, int n, int op, SysctlEntr
  * the kernel, simply write DEVCONFS_UNUSED
  * into the image so we would skip it.
  */
-#define DEVCONFS_UNUSED        (-1u)
+#define DEVCONFS_UNUSED		(-1u)
 
 static int ipv4_conf_op_old(char *tgt, int *conf, int n, int op, int *def_conf)
 {
@@ -1914,17 +1919,45 @@ out:
 
 static int restore_ip_dump(int type, int pid, char *cmd)
 {
-	int ret = -1;
+	int ret = -1, sockfd, n, written;
+	FILE *tmp_file;
 	struct cr_img *img;
+	char buf[1024];
 
 	img = open_image(type, O_RSTR, pid);
 	if (empty_image(img)) {
 		close_image(img);
 		return 0;
 	}
+	sockfd = img_raw_fd(img);
+	tmp_file = tmpfile();
+	if (!tmp_file) {
+		pr_perror("Failed to open tmpfile");
+		return -1;
+	}
+
+	while ((n = read(sockfd, buf, 1024)) > 0) {
+		written = fwrite(buf, sizeof(char), n, tmp_file);
+		if (written < n) {
+			pr_perror("Failed to write to tmpfile "
+				  "[written: %d; total: %d]", written, n);
+			goto close;
+		}
+	}
+
+	if (fseek(tmp_file, 0, SEEK_SET)) {
+		pr_perror("Failed to set file position to beginning of tmpfile");
+		goto close;
+	}
+
 	if (img) {
-		ret = run_ip_tool(cmd, "restore", NULL, NULL, img_raw_fd(img), -1, 0);
+		ret = run_ip_tool(cmd, "restore", NULL, NULL, fileno(tmp_file), -1, 0);
 		close_image(img);
+	}
+
+close:
+	if(fclose(tmp_file)) {
+		pr_perror("Failed to close tmpfile");
 	}
 
 	return ret;
@@ -2027,6 +2060,7 @@ static inline int restore_iptables(int pid)
 		return -1;
 	if (empty_image(img)) {
 		ret = 0;
+		close_image(img);
 		goto ipt6;
 	}
 
@@ -2718,6 +2752,54 @@ static int prep_ns_sockets(struct ns_id *ns, bool for_dump)
 	} else
 		ns->net.nlsk = -1;
 
+#ifdef CONFIG_HAS_SELINUX
+	/*
+	 * If running on a system with SELinux enabled the socket for the
+	 * communication between parasite daemon and the main
+	 * CRIU process needs to be correctly labeled.
+	 * Initially this was motivated by Podman's use case: The container
+	 * is usually running as something like '...:...:container_t:...:....'
+	 * and CRIU started from runc and Podman will run as
+	 * '...:...:container_runtime_t:...:...'. As the parasite will be
+	 * running with the same context as the container process: 'container_t'.
+	 * Allowing a container process to connect via socket to the outside
+	 * of the container ('container_runtime_t') is not desired and
+	 * therefore CRIU needs to label the socket with the context of
+	 * the container: 'container_t'.
+	 * So this first gets the context of the root container process
+	 * and tells SELinux to label the next created socket with
+	 * the same label as the root container process.
+	 * For this to work it is necessary to have the correct SELinux
+	 * policies installed. For Fedora based systems this is part
+	 * of the container-selinux package.
+	 */
+	security_context_t ctx;
+
+	/*
+	 * This assumes that all processes CRIU wants to dump are labeled
+	 * with the same SELinux context. If some of the child processes
+	 * have different labels this will not work and needs additional
+	 * SELinux policies. But the whole SELinux socket labeling relies
+	 * on the correct SELinux being available.
+	 */
+	if (kdat.lsm == LSMTYPE__SELINUX) {
+		ret = getpidcon_raw(root_item->pid->real, &ctx);
+		if (ret < 0) {
+			pr_perror("Getting SELinux context for PID %d failed",
+				  root_item->pid->real);
+			goto err_sq;
+		}
+
+		ret = setsockcreatecon(ctx);
+		freecon(ctx);
+		if (ret < 0) {
+			pr_perror("Setting SELinux socket context for PID %d failed",
+				  root_item->pid->real);
+			goto err_sq;
+		}
+	}
+#endif
+
 	ret = ns->net.seqsk = socket(PF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK, 0);
 	if (ret < 0) {
 		pr_perror("Can't create seqsk for parasite");
@@ -2725,6 +2807,23 @@ static int prep_ns_sockets(struct ns_id *ns, bool for_dump)
 	}
 
 	ret = 0;
+
+#ifdef CONFIG_HAS_SELINUX
+	/*
+	 * Once the socket has been created, reset the SELinux socket labelling
+	 * back to the default value of this process.
+	 */
+	if (kdat.lsm == LSMTYPE__SELINUX) {
+		ret = setsockcreatecon_raw(NULL);
+		if (ret < 0) {
+			pr_perror("Resetting SELinux socket context to "
+				  "default for PID %d failed",
+				  root_item->pid->real);
+			goto err_ret;
+		}
+	}
+#endif
+
 out:
 	if (nsret >= 0 && restore_ns(nsret, &net_ns_desc) < 0) {
 		nsret = -1;
@@ -2949,22 +3048,22 @@ int move_veth_to_bridge(void)
 #ifndef NETNSA_MAX
 /* Attributes of RTM_NEWNSID/RTM_GETNSID messages */
 enum {
-        NETNSA_NONE,
+	NETNSA_NONE,
 #define NETNSA_NSID_NOT_ASSIGNED -1
-        NETNSA_NSID,
-        NETNSA_PID,
-        NETNSA_FD,
-        __NETNSA_MAX,
+	NETNSA_NSID,
+	NETNSA_PID,
+	NETNSA_FD,
+	__NETNSA_MAX,
 };
 
-#define NETNSA_MAX              (__NETNSA_MAX - 1)
+#define NETNSA_MAX		(__NETNSA_MAX - 1)
 #endif
 
 static struct nla_policy rtnl_net_policy[NETNSA_MAX + 1] = {
-        [NETNSA_NONE]           = { .type = NLA_UNSPEC },
-        [NETNSA_NSID]           = { .type = NLA_S32 },
-        [NETNSA_PID]            = { .type = NLA_U32 },
-        [NETNSA_FD]             = { .type = NLA_U32 },
+	[NETNSA_NONE]		= { .type = NLA_UNSPEC },
+	[NETNSA_NSID]		= { .type = NLA_S32 },
+	[NETNSA_PID]		= { .type = NLA_U32 },
+	[NETNSA_FD]		= { .type = NLA_U32 },
 };
 
 static int nsid_cb(struct nlmsghdr *msg, struct ns_id *ns, void *arg)
@@ -3121,12 +3220,6 @@ int kerndat_link_nsid()
 		};
 		int nsfd, sk, ret;
 
-		sk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
-		if (sk < 0) {
-			pr_perror("Unable to create a netlink socket");
-			exit(1);
-		}
-
 		if (unshare(CLONE_NEWNET)) {
 			pr_perror("Unable create a network namespace");
 			exit(1);
@@ -3138,6 +3231,12 @@ int kerndat_link_nsid()
 
 		if (unshare(CLONE_NEWNET)) {
 			pr_perror("Unable create a network namespace");
+			exit(1);
+		}
+
+		sk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+		if (sk < 0) {
+			pr_perror("Unable to create a netlink socket");
 			exit(1);
 		}
 

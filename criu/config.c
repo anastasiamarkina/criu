@@ -40,20 +40,91 @@ static int count_elements(char **to_count)
 	return count;
 }
 
+/* Parse one statement in configuration file */
+int parse_statement(int i, char *line, char **configuration)
+{
+	int offset = 0, len = 0;
+	bool was_newline = true;
+	char *tmp_string, *quoted, *quotedptr;
+
+	while (1) {
+		/* Ignore white-space */
+		while ((isspace(*(line + offset)) && (*(line + offset) != '\n'))) offset++;
+
+		/* Read a single word. A word is everything
+		 * that doesn't contain white-space characters. */
+		if (sscanf(line + offset, "%m[^ \t\n]s", &configuration[i]) != 1) {
+			configuration[i] = NULL;
+			break;
+		}
+
+		/* Ignore comments - everything between '#' and '\n' */
+		if (configuration[i][0] == '#') {
+			configuration[i] = NULL;
+			break;
+		}
+
+		if ((configuration[i][0] == '\"') && (strchr(line + offset + 1, '"'))) {
+			/* Handle empty strings which strtok ignores */
+			if (!strcmp(configuration[i], "\"\"")) {
+				configuration[i] = "";
+				offset += strlen("\"\"");
+			} else if ((configuration[i] = strtok_r(line + offset, "\"", &quotedptr))) {
+				/* Handle escaping of quotes in quoted string */
+				while (configuration[i][strlen(configuration[i]) - 1] == '\\') {
+					offset++;
+					len = strlen(configuration[i]);
+					configuration[i][len - 1] = '"';
+					if (*quotedptr == '"') {
+						quotedptr++;
+						break;
+					}
+					quoted = strtok_r(NULL, "\"", &quotedptr);
+					tmp_string = xmalloc(len + strlen(quoted) + 1);
+					if (tmp_string == NULL)
+						return -1;
+
+					memmove(tmp_string, configuration[i], len);
+					memmove(tmp_string + len, quoted, strlen(quoted) + 1);
+					configuration[i] = tmp_string;
+				}
+				offset += 2;
+			}
+		}
+
+		offset += strlen(configuration[i]);
+
+		if (was_newline) {
+			was_newline = false;
+			len = strlen(configuration[i]);
+			tmp_string = xrealloc(configuration[i], len + strlen("--") + 1);
+			if (tmp_string == NULL)
+				return -1;
+
+			memmove(tmp_string + strlen("--"), tmp_string, len + 1);
+			memmove(tmp_string, "--", strlen("--"));
+			configuration[i] = tmp_string;
+		}
+		i++;
+	}
+
+	return i;
+}
+
+/* Parse a configuration file */
 static char ** parse_config(char *filepath)
 {
 #define DEFAULT_CONFIG_SIZE	10
 	FILE* configfile = fopen(filepath, "r");
 	int config_size = DEFAULT_CONFIG_SIZE;
-	int i = 1, len = 0, offset;
-	size_t limit = 0;
-	bool was_newline;
-	char *tmp_string, *line = NULL, *quoted, *quotedptr;
-	char **configuration, **tmp_conf;
+	int i = 1;
+	size_t line_size = 0;
+	char *line = NULL;
+	char **configuration;
 
-	if (!configfile) {
+	if (!configfile)
 		return NULL;
-	}
+
 	configuration = xmalloc(config_size * sizeof(char *));
 	if (configuration == NULL) {
 		fclose(configfile);
@@ -64,85 +135,28 @@ static char ** parse_config(char *filepath)
 	 */
 	configuration[0] = "criu";
 
-	while ((len = getline(&line, &limit, configfile)) != -1) {
-		offset = 0;
-		was_newline = true;
+	while (getline(&line, &line_size, configfile) != -1) {
+		/* Extend configuration buffer if necessary */
 		if (i >= config_size - 1) {
 			config_size *= 2;
-			tmp_conf = xrealloc(configuration, config_size * sizeof(char *));
-			if (tmp_conf == NULL) {
+			configuration = xrealloc(configuration, config_size * sizeof(char *));
+			if (configuration == NULL) {
 				fclose(configfile);
 				exit(1);
 			}
-			configuration = tmp_conf;
 		}
-		while (1) {
-			while ((isspace(*(line + offset)) && (*(line + offset) != '\n'))) offset++;
 
-			if (sscanf(line + offset, "%m[^ \t\n]s", &configuration[i]) != 1) {
-				configuration[i] = NULL;
-				break;
-			}
-
-			if (configuration[i][0] == '#') {
-				if (sscanf(line, "%*[^\n]") != 0) {
-					pr_err("Error while reading configuration file %s\n", filepath);
-					fclose(configfile);
-					exit(1);
-				}
-				configuration[i] = NULL;
-				break;
-			}
-			if ((configuration[i][0] == '\"') && (strchr(line + offset + 1, '"'))) {
-				/*
-				 * Handle empty strings which strtok ignores
-				 */
-				if (!strcmp(configuration[i], "\"\"")) {
-					configuration[i] = "";
-					offset += strlen("\"\"");
-				} else if ((configuration[i] = strtok_r(line + offset, "\"", &quotedptr))) {
-					/*
-					 * Handle escaping of quotes in quoted string
-					 */
-					while (configuration[i][strlen(configuration[i]) - 1] == '\\') {
-						offset++;
-						len = strlen(configuration[i]);
-						configuration[i][len - 1] = '"';
-						if (*quotedptr == '"') {
-							quotedptr++;
-							break;
-						}
-						quoted = strtok_r(NULL, "\"", &quotedptr);
-						tmp_string = xmalloc(len + strlen(quoted) + 1);
-						if (tmp_string == NULL) {
-							fclose(configfile);
-							exit(1);
-						}
-						memmove(tmp_string, configuration[i], len);
-						memmove(tmp_string + len, quoted, strlen(quoted) + 1);
-						configuration[i] = tmp_string;
-					}
-					offset += 2;
-				}
-			}
-			offset += strlen(configuration[i]);
-			if (was_newline) {
-				was_newline = false;
-				len = strlen(configuration[i]);
-				tmp_string = xrealloc(configuration[i], len + strlen("--") + 1);
-				if (tmp_string == NULL) {
-					fclose(configfile);
-					exit(1);
-				}
-				memmove(tmp_string + strlen("--"), tmp_string, len + 1);
-				memmove(tmp_string, "--", strlen("--"));
-				configuration[i] = tmp_string;
-			}
-			i++;
+		i = parse_statement(i, line, configuration);
+		if (i < 0) {
+			fclose(configfile);
+			exit(1);
 		}
+
 		free(line);
 		line = NULL;
 	}
+	/* Initialize the last element */
+	configuration[i] = NULL;
 
 	free(line);
 	fclose(configfile);
@@ -354,6 +368,8 @@ static int parse_manage_cgroups(struct cr_options *opts, const char *optarg)
 		opts->manage_cgroups = CG_MODE_FULL;
 	} else if (!strcmp(optarg, "strict")) {
 		opts->manage_cgroups = CG_MODE_STRICT;
+	} else if (!strcmp(optarg, "ignore")) {
+		opts->manage_cgroups = CG_MODE_IGNORE;
 	} else
 		goto Esyntax;
 
@@ -363,6 +379,8 @@ Esyntax:
 	pr_err("Unknown cgroups mode `%s' selected\n", optarg);
 	return -1;
 }
+
+extern char *index(const char *s, int c);
 
 static size_t parse_size(char *optarg)
 {
@@ -422,7 +440,7 @@ int parse_options(int argc, char **argv, bool *usage_error,
 		{OPT_NAME, no_argument, SAVE_TO, true},\
 		{"no-" OPT_NAME, no_argument, SAVE_TO, false}
 
-	static const char short_opts[] = "dSsR:t:hD:o:v::x::Vr:jJ:lW:L:M:";
+	static const char short_opts[] = "dSsRt:hD:o:v::x::Vr:jJ:lW:L:M:";
 	static struct option long_opts[] = {
 		{ "tree",			required_argument,	0, 't'	},
 		{ "leave-stopped",		no_argument,		0, 's'	},
@@ -490,8 +508,15 @@ int parse_options(int argc, char **argv, bool *usage_error,
 		BOOL_OPT(SK_CLOSE_PARAM, &opts.tcp_close),
 		{ "verbosity",			optional_argument,	0, 'v'	},
 		{ "ps-socket",			required_argument,	0, 1091},
+		BOOL_OPT("remote", &opts.remote),
 		{ "config",			required_argument,	0, 1089},
 		{ "no-default-config",		no_argument,		0, 1090},
+		{ "tls-cacert",			required_argument,	0, 1092},
+		{ "tls-cacrl",			required_argument,	0, 1093},
+		{ "tls-cert",			required_argument,	0, 1094},
+		{ "tls-key",			required_argument,	0, 1095},
+		BOOL_OPT("tls", &opts.tls),
+		{"tls-no-cn-verify",		no_argument,		&opts.tls_no_cn_verify, true},
 		{ },
 	};
 
@@ -778,6 +803,18 @@ int parse_options(int argc, char **argv, bool *usage_error,
 		case 1091:
 			opts.ps_socket = atoi(optarg);
 			break;
+		case 1092:
+			SET_CHAR_OPTS(tls_cacert, optarg);
+			break;
+		case 1093:
+			SET_CHAR_OPTS(tls_cacrl, optarg);
+			break;
+		case 1094:
+			SET_CHAR_OPTS(tls_cert, optarg);
+			break;
+		case 1095:
+			SET_CHAR_OPTS(tls_key, optarg);
+			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);
 			if (strcmp(CRIU_GITID, "0"))
@@ -801,4 +838,55 @@ bad_arg:
 		pr_msg("Error: invalid argument for --%s: %s\n",
 				long_opts[idx].name, optarg);
 	return 1;
+}
+
+int check_options()
+{
+	if (opts.tcp_established_ok)
+		pr_info("Will dump/restore TCP connections\n");
+	if (opts.tcp_skip_in_flight)
+		pr_info("Will skip in-flight TCP connections\n");
+	if (opts.tcp_close)
+		pr_info("Will drop all TCP connections on restore\n");
+	if (opts.link_remap_ok)
+		pr_info("Will allow link remaps on FS\n");
+	if (opts.weak_sysctls)
+		pr_info("Will skip non-existant sysctls on restore\n");
+
+	if (opts.deprecated_ok)
+		pr_info("Turn deprecated stuff ON\n");
+	else if (getenv("CRIU_DEPRECATED")) {
+		pr_info("Turn deprecated stuff ON via env\n");
+		opts.deprecated_ok = true;
+	}
+
+	if (!opts.restore_detach && opts.restore_sibling) {
+		pr_err("--restore-sibling only makes sense with --restore-detach\n");
+		return 1;
+	}
+
+	if (opts.ps_socket != -1) {
+		if (opts.addr || opts.port)
+			pr_warn("Using --address or --port in "
+				"combination with --ps-socket is obsolete\n");
+		if (opts.ps_socket <= STDERR_FILENO && opts.daemon_mode) {
+			pr_err("Standard file descriptors will be closed"
+				" in daemon mode\n");
+			return 1;
+		}
+	}
+
+#ifndef CONFIG_GNUTLS
+	if (opts.tls) {
+		pr_err("CRIU was built without TLS support\n");
+		return 1;
+	}
+#endif
+
+	if (check_namespace_opts()) {
+		pr_err("Error: namespace flags conflict\n");
+		return 1;
+	}
+
+	return 0;
 }

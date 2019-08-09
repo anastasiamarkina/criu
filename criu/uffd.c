@@ -1,7 +1,6 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <errno.h>
-#include <dirent.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <fcntl.h>
@@ -38,6 +37,7 @@
 #include "page-xfer.h"
 #include "common/lock.h"
 #include "rst-malloc.h"
+#include "tls.h"
 #include "fdstore.h"
 #include "util.h"
 
@@ -771,7 +771,7 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 		pr_flags |= PR_REMOTE;
 	ret = open_page_read(lpi->pid, &lpi->pr, pr_flags);
 	if (ret <= 0) {
-		ret = -1;
+		lp_err(lpi, "Failed to open pagemap\n");
 		goto out;
 	}
 
@@ -1428,7 +1428,7 @@ int cr_lazy_pages(bool daemon)
 		return -1;
 
 	if (daemon) {
-		ret = cr_daemon(1, 0, &lazy_sk, -1);
+		ret = cr_daemon(1, 0, -1);
 		if (ret == -1) {
 			pr_err("Can't run in the background\n");
 			return -1;
@@ -1469,6 +1469,8 @@ int cr_lazy_pages(bool daemon)
 	}
 
 	ret = handle_requests(epollfd, events, nr_fds);
+
+	tls_terminate_session();
 
 	return ret;
 }
