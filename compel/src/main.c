@@ -184,7 +184,7 @@ static void cli_log(unsigned int lvl, const char *fmt, unsigned int nargs, unsig
 }
 
 static void bin_log(unsigned int lvl, const char *format, unsigned int nargs, unsigned int mask, va_list argptr)//себе такую
-{	printf("sdf\n");
+{	//printf("sdf\n");
 	flog_msg_t *m = (void *)mbuf;
 	char *str_start, *p;
 	//va_list argptr;
@@ -240,6 +240,20 @@ static void bin_log(unsigned int lvl, const char *format, unsigned int nargs, un
 	
 }
 
+int bin_close(int fdout)
+{
+	if (mbuf == _mbuf)
+		return 0;
+	printf("closing binary log...\n");
+	munmap(fbuf, BUF_SIZE * 2);
+
+	if (ftruncate(fdout, fsize - 2 * BUF_SIZE + mbuf - fbuf)) {
+		fprintf(stderr, "Unable to truncate a file: %m");
+		return -1;
+	}
+	return 0;
+}
+
 static int usage(int rc) {
 	FILE *out = (rc == 0) ? stdout : stderr;
 
@@ -258,7 +272,7 @@ static int usage(int rc) {
 "  compel -V|--version\n"
 , COMPEL_DEFAULT_LOGLEVEL
 );
-
+	
 	return rc;
 }
 
@@ -469,7 +483,7 @@ int fdout = STDOUT_FILENO;
 		case 'l':
 			log_level = atoi(optarg);
 			break;
-		case 'h':
+		case 'h':			
 			return usage(0);
 		case 'V':
 			printf("Version: %d.%d.%d\n",
@@ -483,6 +497,7 @@ int fdout = STDOUT_FILENO;
 			break;
 		default: // '?'
 			// error message already printed by getopt_long()
+			bin_close(fdout);
 			return usage(1);
 			break;
 		}
@@ -515,6 +530,7 @@ int fdout = STDOUT_FILENO;
 		fprintf(stderr, "Error: action argument required\n");
 		if (opts.binlog_filename) 
 			pr_info("writing to binlog for the last time\n");
+		bin_close(fdout);
 		return usage(1);
 	}
 	action = argv[optind++];
