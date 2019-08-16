@@ -2,17 +2,14 @@
 #define __CR_LOG_H__
 
 #include <inttypes.h>
-
+#include "flog/include/uapi/flog.h"
 #ifndef CR_NOGLIBC
 
 #include <string.h>
 #include <errno.h>
 #include <stdarg.h>
 
-#include "flog.h"
 
-/* FIXME: Should be in options? */
-extern flog_ctx_t flog_ctx;
 
 extern void vprint_on_level(unsigned int loglevel, const char *format,
 		va_list params);
@@ -31,75 +28,77 @@ extern void vprint_on_level(unsigned int loglevel, const char *format,
 extern void print_on_level(unsigned int loglevel, const char *format, ...)
 	__attribute__ ((__format__ (__printf__, 2, 3)));
 
+extern void print_on_level_msg(unsigned int loglevel, 
+        unsigned int nargs, const char *format, unsigned int mask,  ...)
+		__attribute__ ((__format__ (__printf__, 3, 5)));
+
 #ifndef LOG_PREFIX
 # define LOG_PREFIX
 #endif
 
 void flush_early_log_buffer(int fd);
 
-#ifdef CR_NOGLIBC
-#undef flog_encode
-#define flog_encode(ctx, fmt, ...)
-#endif
-
-#define print_once(loglevel, fmt, ...)					\
-	do {								\
-		static bool __printed;					\
-		if (!__printed) {					\
-			flog_encode(&flog_ctx, fmt, ##__VA_ARGS__);	\
-			print_on_level(loglevel, fmt, ##__VA_ARGS__);	\
-			__printed = 1;					\
-		}							\
+#define print_once(loglevel, fmt, ...)					               \
+	do {								                               \
+		static bool __printed;					                       \
+		if (!__printed) {					                           \
+			print_on_level_msg(loglevel, FLOG_PP_NARG(VA_ARGS), fmt,   \
+			                 FLOG_GENMASK(flog_genbit, ##__VA_ARGS__), \
+			                 ##__VA_ARGS__);	                       \
+			__printed = 1;					                           \
+		}							                                   \
 	} while (0)
 
-#define pr_msg(fmt, ...)						\
-	do {								\
-	flog_encode(&flog_ctx, fmt, ##__VA_ARGS__);			\
-	print_on_level(LOG_MSG,						\
-		       fmt, ##__VA_ARGS__);				\
-	} while (0)
+#define pr_msg(fmt, ...)											\
+	print_on_level_msg(LOG_MSG,	                          	        \
+	                   FLOG_PP_NARG(VA_ARGS),	                  	\
+	                   fmt, 		                                \
+		               FLOG_GENMASK(flog_genbit, ##__VA_ARGS__),   	\
+		               ##__VA_ARGS__)
 
-#define pr_info(fmt, ...)						\
-	do {								\
-	flog_encode(&flog_ctx, fmt, ##__VA_ARGS__);			\
-	print_on_level(LOG_INFO,					\
-		       LOG_PREFIX fmt, ##__VA_ARGS__);			\
-	} while (0)
+#define pr_info(fmt, ...)											\
+	print_on_level_msg(LOG_INFO,	                          	    \
+	                   FLOG_PP_NARG(VA_ARGS),                    	\
+	                   LOG_PREFIX fmt, 			                	\
+		               FLOG_GENMASK(flog_genbit, ##__VA_ARGS__), 	\
+		               ##__VA_ARGS__)
 
-#define pr_err(fmt, ...)						\
-	do {								\
-	flog_encode(&flog_ctx, fmt, ##__VA_ARGS__);			\
-	print_on_level(LOG_ERROR,					\
-		       "Error (%s:%d): " LOG_PREFIX fmt,		\
-		       __FILE__, __LINE__, ##__VA_ARGS__);		\
-	} while (0)
+#define pr_err(fmt, ...)											\
+	print_on_level_msg(LOG_ERROR,                           	    \
+	                   FLOG_PP_NARG(VA_ARGS),	                  	\
+	                   "Error (%s:%d): " LOG_PREFIX fmt,			\
+		               FLOG_GENMASK(flog_genbit, ##__VA_ARGS__),   	\
+		               __FILE__,                                   	\
+		               __LINE__,                                   	\
+		               ##__VA_ARGS__)
 
-#define pr_err_once(fmt, ...)						\
+#define pr_err_once(fmt, ...)										\
 	print_once(LOG_ERROR, fmt, ##__VA_ARGS__)
 
-#define pr_warn(fmt, ...)						\
-	do {								\
-	flog_encode(&flog_ctx, fmt, ##__VA_ARGS__);			\
-	print_on_level(LOG_WARN,					\
-		       "Warn  (%s:%d): " LOG_PREFIX fmt,		\
-		       __FILE__, __LINE__, ##__VA_ARGS__);		\
-	} while (0)
+#define pr_warn(fmt, ...)											\
+	print_on_level_msg(LOG_WARN,                            	    \
+	                   FLOG_PP_NARG(VA_ARGS),                      	\
+	                   "Warn  (%s:%d): " LOG_PREFIX fmt,	        \
+		               FLOG_GENMASK(flog_genbit, ##__VA_ARGS__),   	\
+		               __FILE__,                                   	\
+		               __LINE__,                                   	\
+		               ##__VA_ARGS__)
 
-#define pr_warn_once(fmt, ...)						\
-       print_once(LOG_WARN,						\
-			"Warn  (%s:%d): " LOG_PREFIX fmt,		\
+#define pr_warn_once(fmt, ...)										\
+       print_once(LOG_WARN,											\
+			"Warn  (%s:%d): " LOG_PREFIX fmt,						\
 			__FILE__, __LINE__, ##__VA_ARGS__)
 
-#define pr_debug(fmt, ...)						\
-	do {								\
-	flog_encode(&flog_ctx, fmt, ##__VA_ARGS__);			\
-	print_on_level(LOG_DEBUG,					\
-		       LOG_PREFIX fmt, ##__VA_ARGS__);			\
-	} while (0)
+#define pr_debug(fmt, ...)											\
+	print_on_level_msg(LOG_DEBUG,	                                \
+	                   FLOG_PP_NARG(VA_ARGS),                      	\
+	                   LOG_PREFIX fmt,		                      	\
+		               FLOG_GENMASK(flog_genbit, ##__VA_ARGS__),   	\
+		               ##__VA_ARGS__)
 
 #ifndef CR_NOGLIBC
 
-#define pr_perror(fmt, ...)						\
+#define pr_perror(fmt, ...)						                    \
 	pr_err(fmt ": %s\n", ##__VA_ARGS__, strerror(errno))
 
 #endif /* CR_NOGLIBC */

@@ -13,26 +13,10 @@
 
 #include "flog.h"
 
-int flog_init(flog_ctx_t *ctx)
-{
-	memset(ctx, 0, sizeof(*ctx));
 
-	/* 20M should be enough for now */
-	ctx->size = ctx->left = 20 << 20;
-	ctx->pos = ctx->buf = malloc(ctx->size);
-	if (!ctx->buf)
-		return -ENOMEM;
+#define BUF_SIZE (1<<20)
 
-	return 0;
-}
-
-void flog_fini(flog_ctx_t *ctx)
-{
-	free(ctx->buf);
-	memset(ctx, 0, sizeof(*ctx));
-}
-
-int flog_decode_msg(flog_msg_t *m, int fdout)
+/*int flog_decode_msg(flog_msg_t *m, int fdout)
 {
 	ffi_type *args[34] = {
 		[0]		= &ffi_type_sint,
@@ -69,39 +53,87 @@ int flog_decode_msg(flog_msg_t *m, int fdout)
 		ret = -1;
 
 	return ret;
-}
+}*/
 
-void flog_decode_all(flog_ctx_t *ctx, int fdout)
+
+
+static char _mbuf[BUF_SIZE];
+static char *mbuf = _mbuf;
+static char *fbuf;
+static uint64_t fsize;
+static uint64_t mbuf_size = sizeof(_mbuf);
+
+int flog_map_buf(int fdout)
 {
-	flog_msg_t *m;
-	char *pos;
+	uint64_t off = 0;
+	void *addr;
 
-	for (pos = ctx->buf; pos < ctx->pos; ) {
-		m = (void *)pos;
-		flog_decode_msg(m ,fdout);
-		pos += m->size;
+	/*
+	 * Two buffers are mmaped into memory. A new one is mapped when a first
+	 * one is completly filled.
+	 */
+	if (fbuf && (mbuf - fbuf < BUF_SIZE))
+		return 0;
+
+	if (fbuf) {
+		if (munmap(fbuf, BUF_SIZE * 2)) {
+			fprintf(stderr, "Unable to unmap a buffer: %m");
+			return 1;
+		}
+		off = mbuf - fbuf - BUF_SIZE;
+		fbuf = NULL;
 	}
+
+	if (fsize == 0)
+		fsize += BUF_SIZE;
+	fsize += BUF_SIZE;
+
+	if (ftruncate(fdout, fsize)) {
+		fprintf(stderr, "Unable to truncate a file: %m");
+		return -1;
+	}
+
+	if (!fbuf)
+		addr = mmap(NULL, BUF_SIZE * 2, PROT_WRITE | PROT_READ,
+			    MAP_FILE | MAP_SHARED, fdout, fsize - 2 * BUF_SIZE);
+	else
+		addr = mremap(fbuf + BUF_SIZE, BUF_SIZE,
+				BUF_SIZE * 2, MREMAP_FIXED, fbuf);
+	if (addr == MAP_FAILED) {
+		fprintf(stderr, "Unable to map a buffer: %m");
+		return -1;
+	}
+
+	fbuf = addr;
+	mbuf = fbuf + off;
+	mbuf_size = 2 * BUF_SIZE;
+
+	return 0;
 }
 
-int flog_encode_msg(flog_ctx_t *ctx, unsigned int nargs, unsigned int mask, const char *format, ...)
-{
-	flog_msg_t *m = (void *)ctx->pos;
+
+//static void bin_log(unsigned int lvl, const char *format, unsigned int nargs, unsigned int mask, va_list argptr)//себе такую
+void flog_encode_msg(unsigned int lvl, const char *format, unsigned int nargs, unsigned int mask, va_list argptr)
+//void flog_encode_msg(unsigned int lvl, unsigned int nargs,	const char *format, unsigned int mask,...)
+{	//printf("sdf\n");
+	flog_msg_t *m = (void *)mbuf;
 	char *str_start, *p;
-	va_list argptr;
+	//va_list argptr;
 	size_t i;
 
 	m->nargs = nargs;
 	m->mask = mask;
 
 	str_start = (void *)m->args + sizeof(m->args[0]) * nargs;
-	p = memccpy(str_start, format, 0, ctx->left - (str_start - ctx->pos));
-	if (!p)
-		return -ENOMEM;
-
-	m->fmt = str_start - ctx->pos;
+	p = memccpy(str_start, format, 0, mbuf_size - (str_start - mbuf));
+	if (!p) {
+		printf("memcpu error %d", 1);
+		return;
+    }
+	m->fmt = str_start - mbuf;
 	str_start = p;
 
-	va_start(argptr, format);
+	//va_start(argptr, format);
 	for (i = 0; i < nargs; i++) {
 		m->args[i] = (long)va_arg(argptr, long);
 		/*
@@ -110,15 +142,17 @@ int flog_encode_msg(flog_ctx_t *ctx, unsigned int nargs, unsigned int mask, cons
 		 * a copy (FIXME implement rodata refs).
 		 */
 		if (mask & (1u << i)) {
-			p = memccpy(str_start, (void *)m->args[i], 0, ctx->left - (str_start - ctx->pos));
-			if (!p)
-				return -ENOMEM;
-			m->args[i] = str_start - ctx->pos;
+			p = memccpy(str_start, (void *)m->args[i], 0, mbuf_size - (str_start - mbuf));
+			if (!p) {
+				printf("memcpu error %d", 2);
+				return;
+			}
+			m->args[i] = str_start - mbuf;
 			str_start = p;
 		}
 	}
-	va_end(argptr);
-	m->size = str_start - ctx->pos;
+	//va_end(argptr);
+	m->size = str_start - mbuf;
 
 	/*
 	 * A magic is required to know where we stop writing into a log file,
@@ -130,10 +164,10 @@ int flog_encode_msg(flog_ctx_t *ctx, unsigned int nargs, unsigned int mask, cons
 	m->version = FLOG_VERSION;
 
 	m->size = round_up(m->size, 8);
+	
+	mbuf += m->size;
+	mbuf_size -= m->size;
 
-	/* Advance position and left bytes in context memory */
-	ctx->left -= m->size;
-	ctx->pos += m->size;
-
-	return 0;
+	
 }
+

@@ -43,12 +43,12 @@
 #include "fault-injection.h"
 #include "proc_parse.h"
 #include "kerndat.h"
+#include "../flog/include/flog.h"
 
 #include "setproctitle.h"
 #include "sysctl.h"
 #include "img-remote.h"
 
-flog_ctx_t flog_ctx;
 
 int main(int argc, char *argv[], char *envp[])
 {
@@ -57,9 +57,6 @@ int main(int argc, char *argv[], char *envp[])
 	bool has_exec_cmd = false;
 	bool has_sub_command;
 	int state = PARSING_GLOBAL_CONF;
-
-	/* FIXME: where to put flog_fini? */
-	flog_init(&flog_ctx);
 
 	BUILD_BUG_ON(CTL_32 != SYSCTL_TYPE__CTL_32);
 	BUILD_BUG_ON(__CTL_STR != SYSCTL_TYPE__CTL_STR);
@@ -77,6 +74,7 @@ int main(int argc, char *argv[], char *envp[])
 		goto usage;
 
 	init_opts();
+
 
 	ret = parse_options(argc, argv, &usage_error, &has_exec_cmd, state);
 
@@ -227,12 +225,8 @@ int main(int argc, char *argv[], char *envp[])
 	if (!strcmp(argv[optind], "lazy-pages"))
 		return cr_lazy_pages(opts.daemon_mode) != 0;
 
-	if (!strcmp(argv[optind], "check")) {
-		ret = cr_check();
-		printf("--- FLOG ---\n");
-		flog_decode_all(&flog_ctx, STDOUT_FILENO);
-		return ret != 0;
-	}
+	if (!strcmp(argv[optind], "check"))
+		return cr_check() != 0;
 
 	if (!strcmp(argv[optind], "page-server"))
 		return cr_page_server(opts.daemon_mode, false, -1) != 0;
@@ -434,6 +428,7 @@ usage:
 "* Logging:\n"
 "  -o|--log-file FILE    log file name\n"
 "     --log-pid          enable per-process logging to separate FILE.pid files\n"
+"     --binlog           use faster binary logging instead of slower text one\n"
 "  -v[v...]|--verbosity  increase verbosity (can use multiple v)\n"
 "  -vNUM|--verbosity=NUM set verbosity to NUM (higher level means more output):\n"
 "                          -v1 - only errors and messages\n"
@@ -473,7 +468,7 @@ usage:
 "  -h|--help             show this text\n"
 "  -V|--version          show version\n"
 	);
-
+	//flog_encode(NULL, 1, "sdf", "1");
 	return 0;
 
 opt_port_missing:

@@ -207,6 +207,7 @@ void flush_early_log_buffer(int fd)
 int log_init(const char *output)
 {
 	int new_logfd, fd;
+	int file_open_flags=opt.binlog?(O_RDWR | O_CREAT | O_TRUNC):(O_CREAT|O_TRUNC|O_WRONLY|O_APPEND);
 
 	gettimeofday(&start, NULL);
 	reset_buf_off();
@@ -218,7 +219,8 @@ int log_init(const char *output)
 			return -1;
 		}
 	} else if (output) {
-		new_logfd = open(output, O_CREAT|O_TRUNC|O_WRONLY|O_APPEND, 0600);
+		int file_open_flags=
+		new_logfd = open(output, file_open_flags, 0644); // 0600);
 		if (new_logfd < 0) {
 			pr_perror("Can't create log file %s", output);
 			return -1;
@@ -234,6 +236,12 @@ int log_init(const char *output)
 	fd = install_service_fd(LOG_FD_OFF, new_logfd);
 	if (fd < 0)
 		goto err;
+	if (opts.binlog) {
+			//fdout = open(opts.binlog_filename, file_open_flags, 0644);
+			flog_map_buf(fdout);)//инициализация буфера
+				
+	}
+
 
 	init_done = 1;
 
@@ -307,7 +315,7 @@ void log_set_loglevel(unsigned int level)
 	current_loglevel = level;
 
 	libsoccr_set_log(level, soccr_print_on_level);
-	compel_log_init(vprint_on_level, level);
+	//compel_log_init(vprint_on_level, level);
 }
 
 unsigned int log_get_loglevel(void)
@@ -392,13 +400,34 @@ void vprint_on_level(unsigned int loglevel, const char *format, va_list params)
 }
 
 void print_on_level(unsigned int loglevel, const char *format, ...)
-{
+{	// ToDo: remove this function as obsolete when all ready
 	va_list params;
 
 	va_start(params, format);
 	vprint_on_level(loglevel, format, params);
 	va_end(params);
 }
+
+void print_on_level_msg(unsigned int loglevel, 
+						unsigned int nargs, const char *format, 
+						unsigned int mask,...)
+{
+	va_list params;
+	//compel_log_fn fn = logfn;
+
+	if (opts.binlog) {	// ToDo: use function pointer instead of if-else 
+
+		va_start(params, mask);
+		flog_encode_msg(loglevel, format, nargs, mask, params);
+		va_end(params);	
+	}
+	else {
+		va_start(params, format);
+		vprint_on_level(loglevel, format, params);
+		va_end(params);
+	}
+}
+
 
 int write_pidfile(int pid)
 {

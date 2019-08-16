@@ -393,11 +393,9 @@ help:
 .PHONY: help
 
 lint:
-	flake8 --version
 	flake8 --config=scripts/flake8.cfg test/zdtm.py
 	flake8 --config=scripts/flake8.cfg test/inhfd/*.py
 	flake8 --config=scripts/flake8.cfg test/others/rpc/config_file.py
-	flake8 --config=scripts/flake8.cfg lib/py/images/pb2dict.py
 
 include Makefile.install
 

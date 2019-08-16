@@ -2,9 +2,10 @@
 #define __UAPI_FLOG_H__
 
 #include <stdbool.h>
+#include <stdarg.h>
 #include <string.h>
 #include <errno.h>
-
+#pragma message ("ADEFINE" "floggggg")
 /*
  * We work with up to 32 arguments in macros here.
  * If more provided -- behaviour is undefined.
@@ -139,27 +140,22 @@ typedef struct {
 	long		args[0];
 } flog_msg_t;
 
-typedef struct {
-	char		*buf;
-	char		*pos;
-	size_t		size;
-	size_t		left;
-} flog_ctx_t;
+extern void flog_encode_msg(unsigned int lvl, const char *format, 
+                            unsigned int nargs, unsigned int mask, 
+                            va_list argptr);
 
-extern int flog_init(flog_ctx_t *ctx);
-extern void flog_fini(flog_ctx_t *ctx);
 
-extern void flog_decode_all(flog_ctx_t *ctx, int fdout);
+//unsigned int loglevel, unsigned int nargs,
+//							const char *format, unsigned int mask,...);
 
-extern int flog_encode_msg(flog_ctx_t *ctx,
-			   unsigned int nargs, unsigned int mask,
-			   const char *format, ...);
-extern int flog_decode_msg(flog_msg_t *m, int fdout);
 
-#define flog_encode(ctx, fmt, ...)						\
-	flog_encode_msg(ctx,							\
-			FLOG_PP_NARG(__VA_ARGS__),				\
-			FLOG_GENMASK(flog_genbit, ##__VA_ARGS__),		\
-			fmt, ##__VA_ARGS__)
+//unsigned int lvl, const char *format, 
+//                            unsigned int nargs, unsigned int mask, 
+//                            va_list argptr);
+//extern int flog_decode_msg(flog_msg_t *m, int fdout);
+
+#define flog_encode(where, fmt, ...)							\
+	flog_encode_msg(where, FLOG_PP_NARG(__VA_ARGS__),				\
+			FLOG_GENMASK(flog_genbit, ##__VA_ARGS__), fmt, ##__VA_ARGS__)
 
 #endif /* __UAPI_FLOG_H__ */
